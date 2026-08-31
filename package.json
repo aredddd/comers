@@ -1,7 +1,7 @@
 {
-  "name": "lark-channel-bridge",
-  "version": "0.7.0",
-  "description": "Bridge Feishu/Lark messenger with local CLI coding agents",
+  "name": "comers",
+  "version": "0.8.0",
+  "description": "Comers turns Feishu/Lark into a mobile client for local Codex tasks",
   "type": "module",
   "packageManager": "pnpm@10.33.0",
   "publishConfig": {
@@ -10,14 +10,18 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/zarazhangrui/feishu-claude-code-bridge.git"
+    "url": "git+https://github.com/aredddd/comers.git"
   },
   "bugs": {
-    "url": "https://github.com/zarazhangrui/feishu-claude-code-bridge/issues"
+    "url": "https://github.com/aredddd/comers/issues"
   },
-  "homepage": "https://github.com/zarazhangrui/feishu-claude-code-bridge#readme",
+  "homepage": "https://github.com/aredddd/comers#readme",
   "bin": {
-    "lark-channel-bridge": "./bin/lark-channel-bridge.mjs"
+    "comers": "./bin/comers.mjs",
+    "lark-channel-bridge": "./bin/lark-channel-bridge.mjs",
+    "lark-channel-artifact": "./bin/lark-channel-artifact.mjs",
+    "lark-channel-send": "./bin/lark-channel-send.mjs",
+    "lark-channel-handoff": "./bin/lark-channel-handoff.mjs"
   },
   "exports": {
     ".": {
@@ -30,6 +34,8 @@
     "bin",
     "README.md",
     "README.zh.md",
+    "PERSONAL_CODEX_SETUP.zh.md",
+    "NOTICE.md",
     "LICENSE"
   ],
   "scripts": {

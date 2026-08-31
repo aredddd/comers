@@ -1,6 +1,8 @@
-# lark-channel-bridge
+# Comers
 
-把飞书 / Lark 消息和本地 Claude Code 或 Codex CLI 打通的轻量 bot。用一条命令启动，扫码绑定 PersonalAgent 应用，然后在飞书里和本机编程助手对话，让它读图、处理文件、改代码。
+把飞书 / Lark 变成 Codex 移动端的轻量网关，也兼容 Claude Code。Comers 只负责消息、任务路由、调度和产物传输；会话、Harness、Skills、MCP 与工具执行仍由 Codex 原生管理。
+
+项目源自 MIT 许可的 [`lark-coding-agent-bridge`](https://github.com/zarazhangrui/lark-coding-agent-bridge)，并针对 Codex App Server、原生 task 管理和个人使用场景进行了扩展。详见 [NOTICE.md](./NOTICE.md)。
 
 [English README](./README.md)
 
@@ -12,9 +14,13 @@
 - **流式卡片**：文本回复和工具调用实时更新在同一张卡片上。
 - **COT 过程消息**：可选先发一条过程消息展示 agent 的阶段性文本和工具调用，再单独发送最终答案。
 - **会话延续**：每个聊天、话题或文档评论有自己的会话，不会互相串。
+- **Codex 移动端模式**：默认通过常驻 Codex App Server 连接真实 Codex task，可查看已有桌面端/CLI 任务、最近 turn、置顶、归档并继续原任务。
+- **原生运行控制**：飞书卡片实时展示 Codex 工具调用和审批请求；支持批准/拒绝、回答问题、`/steer` 追加指示和 `/stop` 原生中断。
 - **排队与消息合并**：短时间连续发送的消息会合并处理；任务运行中收到的普通消息会排队到下一轮，`/new`、`/cd`、`/ws use`、`/stop` 这类命令可以中断当前任务。
 - **多工作空间**：用 `/cd` 切换当前项目，用 `/ws` 保存和复用常用项目目录。
-- **图片 / 文件**：直接发给 bot，bridge 下载到本地后交给本机 agent 处理。
+- **图片 / 文件 / 语音**：直接发给 bot，bridge 下载到本地；图片和语音作为原生多模态输入交给 Codex App Server。
+- **定时任务与主动通知**：`/cron` 创建一次性、间隔、每日或五段 cron 任务，执行结果主动回到原私聊；支持 `/cron history <id>` 查看最近执行与失败原因。
+- **可靠恢复**：正常 WebSocket 重投会去重；进程硬退出后，未完成消息按“至少一次”语义在下次连接时恢复（极窄的断电窗口可能重跑一次）。
 - **卡片按钮**：`/help`、`/ws list`、`/status` 返回可点击的交互卡片。
 
 ## 前置条件
@@ -27,16 +33,20 @@
 
 ## 安装
 
+当前从 GitHub 安装：
+
 ```bash
-npm i -g lark-channel-bridge
-# 或
-pnpm add -g lark-channel-bridge
+git clone https://github.com/aredddd/comers.git
+cd comers
+pnpm install
+pnpm build
+pnpm link --global
 ```
 
 ## 首次启动
 
 ```bash
-lark-channel-bridge run
+comers run
 ```
 
 第一次运行会进入扫码向导：
@@ -52,9 +62,9 @@ lark-channel-bridge run
 如果已经有 PersonalAgent app，可以在初始化时传 `--app-id` 跳过创建应用流程；命令会提示输入 App Secret。
 
 ```bash
-lark-channel-bridge run --app-id cli_xxx
+comers run --app-id cli_xxx
 # 或直接初始化并启动后台服务
-lark-channel-bridge start --app-id cli_xxx
+comers start --app-id cli_xxx
 ```
 
 Lark 国际版应用可加 `--tenant lark`。
@@ -64,9 +74,9 @@ Lark 国际版应用可加 `--tenant lark`。
 `run` 适合首次配置和前台调试。确认 bot 能正常收发消息后，先用 `Ctrl-C` 停掉前台进程，再用系统服务常驻后台：
 
 ```bash
-lark-channel-bridge start
-lark-channel-bridge status
-lark-channel-bridge stop
+comers start
+comers status
+comers stop
 ```
 
 服务层命令必须先全局安装，不能直接用 `npx`。daemon 的 launchd plist / systemd unit / Windows 任务会记录 bridge CLI 的路径；如果这个路径来自 npm 临时缓存，缓存清掉后 daemon 就起不来。`run` 用 `npx` 单次启动没问题。
@@ -74,17 +84,19 @@ lark-channel-bridge stop
 服务层命令按 profile 注册，每个 profile 有独立服务：
 
 ```bash
-lark-channel-bridge start [--profile <name>]
-lark-channel-bridge stop [--profile <name>]
-lark-channel-bridge restart [--profile <name>]
-lark-channel-bridge status [--profile <name>]
-lark-channel-bridge unregister [--profile <name>]
+comers start [--profile <name>]
+comers stop [--profile <name>]
+comers restart [--profile <name>]
+comers status [--profile <name>]
+comers unregister [--profile <name>]
 ```
 
 平台映射：
 - **macOS**：launchd 用户代理 `ai.lark-channel-bridge.bot.<profile>`
 - **Linux**：systemd 用户单元 `lark-channel-bridge.bot.<profile>.service`
 - **Windows**：Task Scheduler 任务 `LarkChannelBridge.Bot.<profile>`，launcher 是 `.cmd`
+
+为兼容改名前已经安装的实例，Comers 继续复用 `~/.lark-channel` 状态目录以及上述系统服务标识；旧的 `lark-channel-bridge` CLI 也保留为别名。
 
 daemon 日志在 `~/.lark-channel/profiles/<profile>/logs/daemon/`。
 
@@ -93,15 +105,15 @@ daemon 日志在 `~/.lark-channel/profiles/<profile>/logs/daemon/`。
 默认情况下，bridge 使用当前激活的 profile；可以通过 `profile use <name>` 切换。每个 profile 会维护独立的应用凭据、会话、工作目录和日志。只有在需要同时连接多个 PersonalAgent 应用，或分别运行 Claude 和 Codex 时，才需要创建多个 profile：
 
 ```bash
-lark-channel-bridge start --profile claude --agent claude
-lark-channel-bridge start --profile codex --agent codex
+comers start --profile claude --agent claude
+comers start --profile codex --agent codex
 ```
 
 例如只重启 Codex bot：
 
 ```bash
-lark-channel-bridge restart --profile codex
-lark-channel-bridge status --profile codex
+comers restart --profile codex
+comers status --profile codex
 ```
 
 ## 命令速查
@@ -109,24 +121,24 @@ lark-channel-bridge status --profile codex
 ### 宿主 CLI
 
 ```text
-lark-channel-bridge run [--profile <name>] [--agent claude|codex] [--workspace <path>] [-c <config>]
-lark-channel-bridge migrate [--profile <name>] [--agent claude|codex]
-lark-channel-bridge ps
-lark-channel-bridge kill <id|#>
-lark-channel-bridge --help
+comers run [--profile <name>] [--agent claude|codex] [--workspace <path>] [-c <config>]
+comers migrate [--profile <name>] [--agent claude|codex]
+comers ps
+comers kill <id|#>
+comers --help
 ```
 
 `profile use <name>` 会切换后续默认启动使用的 profile。需要同时跑 Claude / Codex 两个 bot、连接多套 PersonalAgent 应用，或做脚本化部署时，再使用这些 profile 管理命令：
 
 ```bash
-lark-channel-bridge profile create claude --agent claude
-lark-channel-bridge profile create codex --agent codex
-lark-channel-bridge profile list
-lark-channel-bridge profile use <name>
-lark-channel-bridge profile remove <name>
-lark-channel-bridge profile remove <name> --purge --yes
-lark-channel-bridge profile export <name> [--output ./profile.json] [--force]
-lark-channel-bridge profile export <name> --include-secrets --yes
+comers profile create claude --agent claude
+comers profile create codex --agent codex
+comers profile list
+comers profile use <name>
+comers profile remove <name>
+comers profile remove <name> --purge --yes
+comers profile export <name> [--output ./profile.json] [--force]
+comers profile export <name> --include-secrets --yes
 ```
 
 `profile remove` 默认归档本地状态，也可以删除当前激活的 profile。若还剩其他 profile，会自动切到下一个；若这是最后一个 profile，会清空 root config，之后可以用同名重新创建。只有加 `--purge --yes` 才会永久删除。`profile export` 默认脱敏 app secret；只有加 `--include-secrets --yes` 才会导出敏感配置。
@@ -143,7 +155,15 @@ lark-channel-bridge profile export <name> --include-secrets --yes
 | `/ws save <name>` | 把当前工作目录保存为命名工作空间 |
 | `/ws use <name>` | 切换到命名工作空间 |
 | `/ws remove <name>` | 删除命名工作空间 |
-| `/resume` | 恢复同 agent、工作目录、权限模式兼容的历史会话 |
+| `/resume [N]` | Codex：跨项目分页列出本机桌面端/CLI 已有任务；Claude：列出当前目录历史会话 |
+| `/resume search <关键词>` | 按 Codex 任务标题搜索；选择后自动切到原工作目录 |
+| `/task` | 查看当前 Codex 任务详情与最近 turn |
+| `/pin [on\|off]` | 置顶或取消置顶当前 Codex 任务 |
+| `/archive` | 二次确认后归档当前 Codex 任务 |
+| `/handoff <thread-id>` | 把桌面端/CLI Codex 任务接管到当前飞书私聊 |
+| `/steer <内容>` | 在当前 Codex turn 运行中追加指示 |
+| `/answer <请求ID> <回答>` | 回答 Codex 的自由文本审批问题；选项题可直接点卡片 |
+| `/cron help` | 创建和管理持久化定时任务 |
 | `/status` | 查看 profile、agent、工作目录、会话、lark-cli 身份和运行状态 |
 | `/config` | 调整展示偏好、访问控制和 lark-cli 身份策略 |
 | `/invite user @某人` | 允许用户私聊使用 bot |
@@ -160,6 +180,43 @@ lark-channel-bridge profile export <name> --include-secrets --yes
 | `/help` | 帮助卡片 |
 
 私聊不需要 @。群和话题群默认必须 `@bot`；`@all` 会被忽略。支持的云文档评论里 @bot 就会触发回复。
+
+## Codex 产物回传
+
+这个分支额外提供三个个人路由命令。文件命令只接受工作区内相对路径：
+
+```bash
+# 在飞书消息触发的 Codex run 中：回复到当前消息/当前话题
+lark-channel-artifact ./outputs/report.pdf
+
+# 在普通 Codex 桌面或 CLI run 中：主动发给所选 PersonalAgent 应用的 owner
+lark-channel-send --profile codex ./outputs/report.pdf
+
+# 在 Codex 桌面/CLI 当前任务中：把这条 task 发送成飞书接管卡片
+lark-channel-handoff --profile codex
+
+# 只读检查 owner 路由，不发送消息
+lark-channel-send --profile codex --check
+lark-channel-handoff --profile codex --check
+```
+
+`lark-channel-artifact` 不接受 `chat_id` / `message_id` 参数，路由由 bridge 注入；`lark-channel-send` 和 `lark-channel-handoff` 不接受 `user_id` / `chat_id`，它们通过应用信息接口读取 owner，并只发给 owner。文件命令一次可以发送多个文件。更完整的个人使用安装和验收步骤见 [PERSONAL_CODEX_SETUP.zh.md](./PERSONAL_CODEX_SETUP.zh.md)。
+
+## Codex App Server 模式
+
+Codex profile 默认使用 `app-server` runtime。每个飞书 chat/topic scope 维护一个常驻连接，并直接调用 `thread/start`、`thread/resume`、`turn/start`、`turn/steer` 和 `turn/interrupt`。这让飞书侧复用的是同一条 Codex task，而不是 bridge 伪造的一份聊天记录；工具事件、用量、审批和最终回复也来自同一条协议事件流。
+
+下面只是 profile 中的可选字段片段。当前 Codex 版本无法启动 App Server 时，单次运行会记录原因并自动回退到原来的 `codex exec`；也可以显式固定旧模式：
+
+```json
+{
+  "codex": {
+    "runtime": "exec"
+  }
+}
+```
+
+飞书语音会以 `localAudio` 输入交给 Codex，不在 bridge 内额外调用第三方语音服务。审批卡片只对当前运行有效，按钮回调带签名和一次性 nonce；归档任务必须二次确认。
 
 ## 回复展示与 COT
 
@@ -226,6 +283,9 @@ bridge 会检查所选目录存在、是目录，并且不是 `/`、Home 根、�
 | `~/.lark-channel/active-profile` | 最近选择的 profile |
 | `~/.lark-channel/profiles/<profile>/sessions.json` | 会话状态 |
 | `~/.lark-channel/profiles/<profile>/sessions.json.catalog.json` | agent-aware 会话索引 |
+| `~/.lark-channel/profiles/<profile>/message-ledger.json` | 入站消息去重和崩溃恢复状态 |
+| `~/.lark-channel/profiles/<profile>/scheduled-jobs.json` | 持久化定时任务 |
+| `~/.lark-channel/profiles/<profile>/routes/` | 常驻 Codex task 当前飞书回传路由 |
 | `~/.lark-channel/profiles/<profile>/workspaces.json` | 当前和命名工作空间绑定 |
 | `~/.lark-channel/profiles/<profile>/secrets.enc` | profile 本地加密 secret |
 | `~/.lark-channel/profiles/<profile>/lark-cli/` | 当前 profile 的 lark-cli 目录 |
@@ -330,13 +390,13 @@ pnpm build
 想接自己的监控时，用环境变量指向一个 default export（或导出 `createAdapter`）`AdapterFactory` 的模块：
 
 ```bash
-LARK_CHANNEL_TELEMETRY_MODULE=your-telemetry-package lark-channel-bridge start
+LARK_CHANNEL_TELEMETRY_MODULE=your-telemetry-package comers start
 ```
 
 该模块会收到每一条 `log.*` 事件，以及错误 / 指标钩子，转发到任何你想要的地方。接口从包根导出：
 
 ```ts
-import type { AdapterFactory, TelemetryAdapter, TelemetryEvent } from 'lark-channel-bridge';
+import type { AdapterFactory, TelemetryAdapter, TelemetryEvent } from 'comers';
 
 const createAdapter: AdapterFactory = (meta) => ({
   emit(event) {/* 上报事件 */},
@@ -352,5 +412,9 @@ export default createAdapter;
 ## 许可
 
 [MIT](./LICENSE)
+
+## 设计参考
+
+个人网关的持久会话、语音入口、定时调度和崩溃恢复思路参考了开源的 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)。Codex 连接、task 管理、审批和运行控制使用的是 [Codex App Server](https://learn.chatgpt.com/docs/app-server) 协议；本项目没有把 Hermes 运行时嵌进来。
 
 <img src="./assets/feedback-group-qr.png" alt="飞书反馈群二维码" width="360">

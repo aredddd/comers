@@ -86,6 +86,25 @@ export class ActiveRuns {
     return true;
   }
 
+  async steer(chatId: string, text: string): Promise<'ok' | 'not-running' | 'unsupported'> {
+    const handle = this.handles.get(chatId);
+    if (!handle) return 'not-running';
+    if (!handle.run.steer) return 'unsupported';
+    await handle.run.steer(text);
+    return 'ok';
+  }
+
+  async respondToRequest(
+    chatId: string,
+    requestId: string,
+    decision: import('../agent/types').AgentApprovalDecision,
+    value?: string,
+  ): Promise<boolean> {
+    const handle = this.handles.get(chatId);
+    if (!handle?.run.respondToRequest) return false;
+    return handle.run.respondToRequest(requestId, decision, value);
+  }
+
   async stopAll(): Promise<void> {
     const all = [...this.handles.values()];
     this.handles.clear();

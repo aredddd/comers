@@ -20,6 +20,14 @@ export function renderText(state: RunState): string {
     if (piece) parts.push(piece);
   }
 
+  for (const approval of state.approvals ?? []) {
+    const detail = approval.command ?? approval.detail ?? approval.reason ?? '';
+    const choices = approval.kind === 'user-input'
+      ? `回复 \`/answer ${approval.id} <回答>\``
+      : `回复 \`/approval accept ${approval.id}\` 允许一次，或 \`/approval decline ${approval.id}\` 拒绝`;
+    parts.push(`🔐 **${approval.title}**${detail ? `\n${detail}` : ''}\n${choices}`);
+  }
+
   if (state.terminal === 'interrupted') {
     parts.push('_⏹ 已被中断_');
   } else if (state.terminal === 'idle_timeout') {

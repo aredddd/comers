@@ -1,6 +1,6 @@
 import type { AgentCapability } from '../agent/capability';
 import { resolveModelArg } from '../agent/models';
-import type { AgentEvent } from '../agent/types';
+import type { AgentDeliveryContext, AgentEvent } from '../agent/types';
 import type { ProfileConfig } from '../config/profile-schema';
 import type { AccessDecision } from '../policy/access';
 import {
@@ -35,6 +35,7 @@ export interface StartRunFlowInput {
   executor: RunExecutor;
   now: number;
   stopGraceMs?: number;
+  deliveryContext?: AgentDeliveryContext;
   observability?: {
     profile: string;
     agent: string;
@@ -155,7 +156,15 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
               .map((attachment) => attachment.path)
               .filter((path): path is string => Boolean(path))
           : undefined,
+      audios:
+        input.capability.agentId === 'codex'
+          ? policy.attachments
+              .filter((attachment) => attachment.kind === 'audio' && attachment.decision === 'accepted')
+              .map((attachment) => attachment.path)
+              .filter((path): path is string => Boolean(path))
+          : undefined,
       stopGraceMs: input.stopGraceMs,
+      deliveryContext: input.deliveryContext,
       observability: input.observability,
     });
   } catch (err) {

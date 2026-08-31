@@ -33,10 +33,10 @@ describe('Codex thread history provider', () => {
 
   it('lists cwd-filtered Codex threads through app-server without exposing sub-agent sources', async () => {
     process.env.CODEX_HOME = '/outer/codex-home';
-    const fake = await createFakeCodex();
+    const fake = await createFakeCodex({ nextCursor: 'cursor-next' });
     cleanup.push(fake.dir);
 
-    const entries = await listCodexThreadHistory({
+    const page = await listCodexThreadHistory({
       binary: fake.path,
       cwd: '/repo',
       limit: 2,
@@ -44,7 +44,7 @@ describe('Codex thread history provider', () => {
       timeoutMs: 5000,
     });
 
-    expect(entries).toEqual([
+    expect(page.entries).toEqual([
       {
         threadId: 'thread-new',
         sessionId: 'session-new',
@@ -52,8 +52,11 @@ describe('Codex thread history provider', () => {
         cwd: '/repo',
         createdAtMs: 1_700_000_000_000,
         updatedAtMs: 1_700_000_050_000,
+        recencyAtMs: 1_700_000_050_000,
         source: 'exec',
         name: 'New work',
+        status: 'notLoaded',
+        isPinned: false,
       },
       {
         threadId: 'thread-old',
@@ -62,10 +65,13 @@ describe('Codex thread history provider', () => {
         cwd: '/repo',
         createdAtMs: 1_699_999_000_000,
         updatedAtMs: 1_699_999_500_000,
+        recencyAtMs: 1_699_999_500_000,
         source: 'cli',
-        name: undefined,
+        status: 'notLoaded',
+        isPinned: false,
       },
     ]);
+    expect(page.nextCursor).toBe('cursor-next');
 
     const record = JSON.parse(await readFile(fake.recordPath, 'utf8')) as {
       argv: string[];
@@ -76,15 +82,16 @@ describe('Codex thread history provider', () => {
     expect(record.env.CODEX_HOME).toBe('/outer/codex-home');
     expect(record.requests).toMatchObject([
       { method: 'initialize' },
+      { method: 'initialized' },
       {
         method: 'thread/list',
         params: {
           cwd: '/repo',
           limit: 2,
           archived: false,
-          sortKey: 'updated_at',
+          sortKey: 'recency_at',
           sortDirection: 'desc',
-          useStateDbOnly: true,
+          useStateDbOnly: false,
           sourceKinds: ['cli', 'vscode', 'exec', 'appServer', 'unknown'],
         },
       },
@@ -111,6 +118,32 @@ describe('Codex thread history provider', () => {
     expect(record.env.CODEX_HOME).toBe(join(fake.dir, 'codex-home'));
   });
 
+  it('omits cwd for the global desktop task inventory and forwards title search', async () => {
+    const fake = await createFakeCodex();
+    cleanup.push(fake.dir);
+
+    await listCodexThreadHistory({
+      binary: fake.path,
+      limit: 20,
+      searchTerm: '登录刷新',
+      cursor: 'cursor-current',
+      profileStateDir: fake.dir,
+      timeoutMs: 5000,
+    });
+
+    const record = JSON.parse(await readFile(fake.recordPath, 'utf8')) as {
+      requests: Array<{ method: string; params?: Record<string, unknown> }>;
+    };
+    const list = record.requests.find((request) => request.method === 'thread/list');
+    expect(list?.params).toMatchObject({
+      limit: 20,
+      searchTerm: '登录刷新',
+      cursor: 'cursor-current',
+      useStateDbOnly: false,
+    });
+    expect(list?.params).not.toHaveProperty('cwd');
+  });
+
   it('throws a typed error when app-server rejects the history request', async () => {
     const fake = await createFakeCodex({ failList: true });
     cleanup.push(fake.dir);
@@ -131,7 +164,7 @@ describe('Codex thread history provider', () => {
 
   it('summarizes bridge-prefixed Codex previews using the real user input section', async () => {
     const fake = await createFakeCodex({
-      firstPreview: `# lark-channel-bridge 运行约定\n\n## user_message\n\n${buildAgentPrompt({
+      firstPreview: `# comers 运行约定\n\n## user_message\n\n${buildAgentPrompt({
         context: {
           chatId: 'oc_secret',
           chatType: 'p2p',
@@ -144,7 +177,7 @@ describe('Codex thread history provider', () => {
     });
     cleanup.push(fake.dir);
 
-    const entries = await listCodexThreadHistory({
+    const page = await listCodexThreadHistory({
       binary: fake.path,
       cwd: '/repo',
       limit: 1,
@@ -152,16 +185,19 @@ describe('Codex thread history provider', () => {
       timeoutMs: 5000,
     });
 
-    expect(entries[0]?.preview).toBe('Codex 真实用户问题 第二行');
+    expect(page.entries[0]?.preview).toBe('Codex 真实用户问题 第二行');
   });
 });
 
-async function createFakeCodex(options: { failList?: boolean; firstPreview?: string } = {}): Promise<FakeCodex> {
+async function createFakeCodex(
+  options: { failList?: boolean; firstPreview?: string; nextCursor?: string } = {},
+): Promise<FakeCodex> {
   const dir = await mkdtemp(join(tmpdir(), 'codex-history-test-'));
   const scriptPath = process.platform === 'win32' ? join(dir, 'codex-app-server.mjs') : join(dir, 'codex');
   const path = process.platform === 'win32' ? join(dir, 'codex.cmd') : scriptPath;
   const recordPath = join(dir, 'record.json');
   const firstPreview = options.firstPreview ?? 'new thread prompt';
+  const nextCursor = options.nextCursor ?? null;
   const script = `#!/usr/bin/env node
 import { createInterface } from 'node:readline';
 import { writeFileSync } from 'node:fs';
@@ -266,7 +302,7 @@ rl.on('line', (line) => {
                 turns: []
               }
             ],
-            nextCursor: null,
+            nextCursor: ${JSON.stringify(nextCursor)},
             backwardsCursor: null
           }
         }) + '\\n');

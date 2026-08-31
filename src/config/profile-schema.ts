@@ -40,6 +40,9 @@ export interface SandboxConfig {
 
 export interface CodexConfig {
   binaryPath: string;
+  /** Rich mobile-client runtime. `exec` remains available as a compatibility
+   * fallback for older Codex installations. */
+  runtime?: 'app-server' | 'exec';
   realpath?: string;
   version?: string;
   sha256?: string;
@@ -378,6 +381,7 @@ function normalizeWorkspaces(input: {
 function normalizeCodex(input: CodexConfig & { flags?: unknown }): CodexConfig {
   const codex: CodexConfig = {
     binaryPath: input.binaryPath,
+    runtime: input.runtime === 'exec' ? 'exec' : 'app-server',
     ...(typeof input.realpath === 'string' ? { realpath: input.realpath } : {}),
     ...(typeof input.version === 'string' ? { version: input.version } : {}),
     ...(typeof input.sha256 === 'string' ? { sha256: input.sha256 } : {}),

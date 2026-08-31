@@ -1,3 +1,4 @@
+import { mkdir, realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { CardActionEvent, NormalizedMessage } from '@larksuite/channel';
@@ -14,7 +15,10 @@ import { resolveWorkingDirectory } from '../../../src/policy/workspace.js';
 import { SessionCatalog, type SessionCatalogIdentity } from '../../../src/session/catalog.js';
 import { SessionStore } from '../../../src/session/store.js';
 import { WorkspaceStore } from '../../../src/workspace/store.js';
-import type { CodexThreadHistoryEntry } from '../../../src/session/codex-history.js';
+import type {
+  CodexThreadHistoryEntry,
+  ListCodexThreadHistoryOptions,
+} from '../../../src/session/codex-history.js';
 import type { SessionSummary } from '../../../src/session/history.js';
 import { createFakeAgent } from '../../helpers/fake-agent.js';
 import { createFakeChannel, type FakeChannel } from '../../helpers/fake-channel.js';
@@ -30,6 +34,8 @@ interface Harness {
   identity: SessionCatalogIdentity;
   claudeHistory: SessionSummary[];
   codexHistory: CodexThreadHistoryEntry[];
+  codexHistoryOptions: ListCodexThreadHistoryOptions[];
+  codexNextCursors: string[];
   activeRuns: ActiveRuns;
   pending: PendingQueue;
   run(content: string, options?: { withCatalogIdentity?: boolean; chatMode?: 'p2p' | 'group' | 'topic' }): Promise<boolean>;
@@ -175,19 +181,20 @@ describe('agent-aware resume commands', () => {
     expect(lastMarkdown(h.channel)).toContain('当前上下文没有可恢复的 Codex thread');
   });
 
-  it('does not list Claude local history for Codex when no current thread is recorded', async () => {
+  it('shows the global Codex task picker instead of Claude cwd history', async () => {
     const h = await createHarness('codex');
 
     await expect(h.run('/resume')).resolves.toBe(true);
 
-    expect(lastContentString(h.channel)).toContain('此 cwd 下没有历史会话');
+    expect(lastContentString(h.channel)).toContain('本机 Codex 已有任务（跨项目）');
+    expect(lastContentString(h.channel)).toContain('没有找到匹配的 Codex 任务');
   });
 
-  it('lists Codex history for the current cwd and resumes the selected thread through a nonce', async () => {
+  it('lists global Codex history and resumes the selected thread through a nonce', async () => {
     const h = await createHarness('codex');
     h.codexHistory.push(
-      codexThread('thread-alpha-secret', 'alpha prompt', 1_700_000_100_000),
-      codexThread('thread-beta-secret', 'beta prompt', 1_700_000_000_000),
+      codexThread('thread-alpha-secret', 'alpha prompt', 1_700_000_100_000, h.tmp.workspace),
+      codexThread('thread-beta-secret', 'beta prompt', 1_700_000_000_000, h.tmp.workspace),
     );
 
     await expect(h.run('/resume')).resolves.toBe(true);
@@ -207,12 +214,77 @@ describe('agent-aware resume commands', () => {
       threadId: 'thread-beta-secret',
     });
     expect(h.sessions.getRaw('chat-1')).toBeUndefined();
-    expect(lastMarkdown(h.channel)).toContain('已完成');
+    expect(lastMarkdown(h.channel)).toContain('已切换到 Codex 任务');
+  });
+
+  it('switches the workspace when an existing Codex task belongs to another project', async () => {
+    const h = await createHarness('codex');
+    const targetCwd = join(h.tmp.workspace, 'other-project');
+    await mkdir(targetCwd);
+    const targetRealpath = await realpath(targetCwd);
+    h.codexHistory.push(
+      codexThread('thread-cross-project', 'other project task', 1_700_000_100_000, targetCwd),
+    );
+
+    await expect(h.run('/resume')).resolves.toBe(true);
+    const [nonce] = resumeArgsFromCard(lastContent(h.channel));
+    await expect(h.run(`/resume use ${nonce}`)).resolves.toBe(true);
+
+    expect(h.workspaces.cwdFor('chat-1')).toBe(targetRealpath);
+    const targetIdentity = await commandIdentity('codex', h.controls.profileConfig, h.controls, targetCwd);
+    expect(h.catalog.activeFor(targetIdentity)).toMatchObject({
+      threadId: 'thread-cross-project',
+      lastSummary: 'other project task',
+    });
+    expect(lastMarkdown(h.channel)).toContain('other project task');
+    expect(lastMarkdown(h.channel)).toContain(targetRealpath);
+
+    await expect(h.run('/status')).resolves.toBe(true);
+    expect(lastContentString(h.channel)).toContain('other project task');
+    expect(lastContentString(h.channel)).toContain(targetRealpath);
+  });
+
+  it('passes global scope and title search to the Codex app-server task list', async () => {
+    const h = await createHarness('codex');
+
+    await expect(h.run('/resume search 登录刷新')).resolves.toBe(true);
+
+    expect(h.codexHistoryOptions).toHaveLength(1);
+    expect(h.codexHistoryOptions[0]).toMatchObject({
+      limit: 20,
+      searchTerm: '登录刷新',
+      useStateDbOnly: false,
+    });
+    expect(h.codexHistoryOptions[0]).not.toHaveProperty('cwd');
+  });
+
+  it('pages Codex tasks through an opaque one-time cursor', async () => {
+    const h = await createHarness('codex');
+    h.codexHistory.push(
+      codexThread('thread-page-one', 'page one task', 1_700_000_100_000, h.tmp.workspace),
+    );
+    h.codexNextCursors.push('server-cursor-secret');
+
+    await expect(h.run('/resume')).resolves.toBe(true);
+    const firstCard = lastContent(h.channel);
+    const [pageNonce] = resumeMoreArgsFromCard(firstCard);
+    expect(pageNonce).toBeTypeOf('string');
+    expect(JSON.stringify(firstCard)).not.toContain('server-cursor-secret');
+
+    await expect(h.run(`/resume more ${pageNonce}`)).resolves.toBe(true);
+
+    expect(h.codexHistoryOptions).toHaveLength(2);
+    expect(h.codexHistoryOptions[1]).toMatchObject({
+      cursor: 'server-cursor-secret',
+      limit: 8,
+    });
   });
 
   it('resumes a Codex history selection from the card button callback', async () => {
     const h = await createHarness('codex');
-    h.codexHistory.push(codexThread('thread-alpha-secret', 'alpha prompt', 1_700_000_100_000));
+    h.codexHistory.push(
+      codexThread('thread-alpha-secret', 'alpha prompt', 1_700_000_100_000, h.tmp.workspace),
+    );
 
     await expect(h.run('/resume')).resolves.toBe(true);
 
@@ -223,12 +295,14 @@ describe('agent-aware resume commands', () => {
     expect(h.catalog.activeFor(h.identity)).toMatchObject({
       threadId: 'thread-alpha-secret',
     });
-    expect(lastMarkdown(h.channel)).toContain('已完成');
+    expect(lastMarkdown(h.channel)).toContain('已切换到 Codex 任务');
   });
 
   it('keeps Codex resume history details out of group chats like Claude', async () => {
     const h = await createHarness('codex');
-    h.codexHistory.push(codexThread('thread-alpha-secret', 'alpha prompt', 1_700_000_100_000));
+    h.codexHistory.push(
+      codexThread('thread-alpha-secret', 'alpha prompt', 1_700_000_100_000, h.tmp.workspace),
+    );
 
     await expect(h.run('/resume', { chatMode: 'group' })).resolves.toBe(true);
 
@@ -277,6 +351,8 @@ async function createHarness(
   const catalog = new SessionCatalog(join(tmp.profile, 'session-catalog.json'));
   const claudeHistory: SessionSummary[] = [];
   const codexHistory: CodexThreadHistoryEntry[] = [];
+  const codexHistoryOptions: ListCodexThreadHistoryOptions[] = [];
+  const codexNextCursors: string[] = [];
   const activeRuns = new ActiveRuns();
   const pending = new PendingQueue(60_000, () => {});
   const agent = createFakeAgent();
@@ -304,25 +380,37 @@ async function createHarness(
     resolve: async () => 'p2p',
   } as unknown as ChatModeCache;
 
-  const run = (
+  const run = async (
     content: string,
     runOptions: { withCatalogIdentity?: boolean; chatMode?: 'p2p' | 'group' | 'topic' } = {},
-  ): Promise<boolean> =>
-    tryHandleCommand({
+  ): Promise<boolean> => {
+    const currentCwd = workspaces.cwdFor('chat-1') ?? profileConfig.workspaces.default;
+    const currentIdentity = currentCwd
+      ? await commandIdentity(agentKind, profileConfig, controls, currentCwd)
+      : undefined;
+    return tryHandleCommand({
       channel: channel as unknown as CommandContext['channel'],
       msg: message(content),
       scope: 'chat-1',
       chatMode: runOptions.chatMode ?? 'p2p',
       sessions,
       sessionCatalog: catalog,
-      sessionCatalogIdentity: runOptions.withCatalogIdentity === false ? undefined : identity,
+      sessionCatalogIdentity: runOptions.withCatalogIdentity === false ? undefined : currentIdentity,
       workspaces,
       agent,
       activeRuns,
       controls,
       claudeHistoryProvider: async () => claudeHistory,
-      codexHistoryProvider: async () => codexHistory,
+      codexHistoryProvider: async (historyOptions) => {
+        codexHistoryOptions.push(historyOptions);
+        const nextCursor = codexNextCursors.shift();
+        return {
+          entries: codexHistory,
+          ...(nextCursor ? { nextCursor } : {}),
+        };
+      },
     });
+  };
 
   const dispatchResumeArg = (arg: string): Promise<void> =>
     handleCardAction({
@@ -354,6 +442,8 @@ async function createHarness(
     identity,
     claudeHistory,
     codexHistory,
+    codexHistoryOptions,
+    codexNextCursors,
     activeRuns,
     pending,
     run,
@@ -484,18 +574,38 @@ function resumeArgsFromCard(card: unknown): string[] {
   return out;
 }
 
+function resumeMoreArgsFromCard(card: unknown): string[] {
+  const out: string[] = [];
+  const visit = (value: unknown): void => {
+    if (!value || typeof value !== 'object') return;
+    const record = value as Record<string, unknown>;
+    const action = record.value as Record<string, unknown> | undefined;
+    if (action?.cmd === 'resume.more' && typeof action.arg === 'string') out.push(action.arg);
+    for (const child of Object.values(record)) {
+      if (Array.isArray(child)) child.forEach(visit);
+      else visit(child);
+    }
+  };
+  visit(card);
+  return out;
+}
+
 function codexThread(
   threadId: string,
   preview: string,
   updatedAtMs: number,
+  cwd: string,
 ): CodexThreadHistoryEntry {
   return {
     threadId,
     sessionId: threadId,
     preview,
-    cwd: '/tmp/workspace',
+    cwd,
     createdAtMs: updatedAtMs - 1000,
     updatedAtMs,
+    recencyAtMs: updatedAtMs,
     source: 'exec',
+    status: 'notLoaded',
+    isPinned: false,
   };
 }

@@ -1,4 +1,4 @@
-import type { AgentEvent } from '../agent/types';
+import type { AgentApprovalRequest, AgentEvent } from '../agent/types';
 
 export type ToolStatus = 'running' | 'done' | 'error';
 
@@ -19,6 +19,7 @@ export type Terminal = 'running' | 'done' | 'interrupted' | 'error' | 'idle_time
 
 export interface RunState {
   blocks: Block[];
+  approvals?: AgentApprovalRequest[];
   finalText?: string;
   reasoning: { content: string; active: boolean };
   footer: FooterStatus;
@@ -31,6 +32,7 @@ export interface RunState {
 
 export const initialState: RunState = {
   blocks: [],
+  approvals: [],
   reasoning: { content: '', active: false },
   footer: 'thinking',
   terminal: 'running',
@@ -104,6 +106,23 @@ export function reduce(state: RunState, evt: AgentEvent): RunState {
       return { ...state, blocks };
     }
 
+    case 'approval_request':
+      return {
+        ...state,
+        approvals: [
+          ...(state.approvals ?? []).filter((request) => request.id !== evt.request.id),
+          evt.request,
+        ],
+        footer: 'tool_running',
+      };
+
+    case 'approval_resolved':
+      return {
+        ...state,
+        approvals: (state.approvals ?? []).filter((request) => request.id !== evt.requestId),
+        footer: (state.approvals?.length ?? 0) > 1 ? 'tool_running' : 'thinking',
+      };
+
     case 'error': {
       const terminal =
         evt.terminationReason === 'interrupted'
@@ -113,6 +132,7 @@ export function reduce(state: RunState, evt: AgentEvent): RunState {
             : 'error';
       return {
         ...state,
+        approvals: [],
         terminal,
         errorMsg: terminal === 'error' ? evt.message : state.errorMsg,
         footer: null,
@@ -128,6 +148,7 @@ export function reduce(state: RunState, evt: AgentEvent): RunState {
             : 'done';
       return {
         ...state,
+        approvals: [],
         blocks: closeStreamingText(state.blocks),
         reasoning: { ...state.reasoning, active: false },
         terminal,

@@ -17,10 +17,14 @@ import type {
 } from '../types';
 import { buildCodexArgs } from './argv';
 import { CodexJsonlTranslator, type CodexFinishReason } from './jsonl';
+import { CodexAppServerSession } from './app-server-session';
 
 export interface CodexAdapterOptions {
   binary: string;
   profileStateDir: string;
+  /** Direct constructors keep legacy exec behavior unless explicitly opted in;
+   * normalized runtime profiles pass `app-server`. */
+  runtime?: 'app-server' | 'exec';
   codexHome?: string;
   inheritCodexHome?: boolean;
   ignoreUserConfig?: boolean;
@@ -38,6 +42,7 @@ export class CodexAdapter implements AgentAdapter {
 
   private readonly binary: string;
   private readonly profileStateDir: string;
+  private readonly runtime: 'app-server' | 'exec';
   private readonly codexHome: string | undefined;
   private readonly inheritCodexHome: boolean;
   private readonly ignoreUserConfig: boolean;
@@ -46,10 +51,16 @@ export class CodexAdapter implements AgentAdapter {
   private readonly defaultStopGraceMs: number;
   private readonly larkChannel: LarkChannelEnvContext | undefined;
   private botIdentity: AgentBotIdentity | undefined;
+  private readonly appServerSessions = new Map<string, CodexAppServerSession>();
+  private readonly preparedRuns = new Map<
+    string,
+    { kind: 'app-server'; session: CodexAppServerSession } | { kind: 'exec' }
+  >();
 
   constructor(opts: CodexAdapterOptions) {
     this.binary = opts.binary;
     this.profileStateDir = opts.profileStateDir;
+    this.runtime = opts.runtime ?? 'exec';
     this.codexHome = opts.codexHome;
     this.inheritCodexHome = opts.inheritCodexHome !== false;
     this.ignoreUserConfig = opts.ignoreUserConfig === true;
@@ -76,7 +87,7 @@ export class CodexAdapter implements AgentAdapter {
     });
   }
 
-  async prepareRun(): Promise<void> {
+  async prepareRun(opts?: AgentRunOptions): Promise<void> {
     const availability = await this.checkAvailability();
     if (!availability.ok) {
       throw new SpawnFailed(
@@ -86,9 +97,90 @@ export class CodexAdapter implements AgentAdapter {
         availability.diagnostic,
       );
     }
+    if (this.runtime !== 'app-server') return;
+    if (!opts?.cwd || !opts.scopeId) {
+      // Legacy/direct callers do not have a Feishu scope. They keep the
+      // one-shot exec behavior instead of failing startup compatibility.
+      if (opts) this.preparedRuns.set(opts.runId, { kind: 'exec' });
+      log.info('app-server', 'fallback-exec-no-scope', {
+        hasOptions: Boolean(opts),
+        hasCwd: Boolean(opts?.cwd),
+        hasScope: Boolean(opts?.scopeId),
+      });
+      return;
+    }
+    const scopeId = opts.scopeId;
+    let session: CodexAppServerSession | undefined;
+    try {
+      session = this.appServerSessions.get(scopeId);
+      const canReuse = Boolean(
+        session &&
+        !session.exited &&
+        session.cwd === opts.cwd &&
+        session.sandbox === (opts.sandbox ?? this.sandbox) &&
+        opts.threadId &&
+        session.threadId === opts.threadId,
+      );
+      if (session && !canReuse) {
+        this.appServerSessions.delete(scopeId);
+        await session.close().catch((error) => {
+          log.warn('app-server', 'replace-close-failed', { error: errorMessage(error) });
+        });
+        session = undefined;
+      }
+      if (!session) {
+        session = new CodexAppServerSession({
+          binary: this.binary,
+          profileStateDir: this.profileStateDir,
+          cwd: opts.cwd,
+          scopeId,
+          ...(opts.threadId ? { requestedThreadId: opts.threadId } : {}),
+          ...(opts.model ? { model: opts.model } : {}),
+          sandbox: opts.sandbox ?? this.sandbox,
+          ...(this.codexHome ? { codexHome: this.codexHome } : {}),
+          inheritCodexHome: this.inheritCodexHome,
+          ...(this.larkChannel ? { larkChannel: this.larkChannel } : {}),
+          ...(this.botIdentity ? { botIdentity: this.botIdentity } : {}),
+        });
+        await session.connect();
+        this.appServerSessions.set(scopeId, session);
+      }
+      await session.prepareDelivery(opts);
+      this.preparedRuns.set(opts.runId, { kind: 'app-server', session });
+    } catch (error) {
+      // Compatibility escape hatch for older/partially-installed Codex builds.
+      // A single failed rich-runtime startup must not take the already-working
+      // personal bot offline; the run falls back to `codex exec` and logs why.
+      log.warn('app-server', 'fallback-exec', { error: errorMessage(error) });
+      if (session) {
+        if (this.appServerSessions.get(scopeId) === session) {
+          this.appServerSessions.delete(scopeId);
+        }
+        await session.close().catch((closeError) => {
+          log.warn('app-server', 'fallback-close-failed', {
+            error: errorMessage(closeError),
+          });
+        });
+      }
+      this.preparedRuns.set(opts.runId, { kind: 'exec' });
+    }
   }
 
   run(opts: AgentRunOptions): AgentRun {
+    const prepared = this.preparedRuns.get(opts.runId);
+    this.preparedRuns.delete(opts.runId);
+    if (prepared?.kind === 'app-server') return prepared.session.run(opts);
+    return this.runExec(opts);
+  }
+
+  async close(): Promise<void> {
+    const sessions = [...this.appServerSessions.values()];
+    this.appServerSessions.clear();
+    this.preparedRuns.clear();
+    await Promise.allSettled(sessions.map((session) => session.close()));
+  }
+
+  private runExec(opts: AgentRunOptions): AgentRun {
     if (!opts.cwd) {
       throw new Error('cwd is required for CodexAdapter.run');
     }
@@ -102,7 +194,10 @@ export class CodexAdapter implements AgentAdapter {
       ignoreRules: this.ignoreRules,
       model: opts.model,
     });
-    const envOverrides: NodeJS.ProcessEnv = buildLarkChannelEnv(this.larkChannel);
+    const envOverrides: NodeJS.ProcessEnv = buildLarkChannelEnv(
+      this.larkChannel,
+      opts.deliveryContext,
+    );
     if (this.codexHome) {
       envOverrides.CODEX_HOME = this.codexHome;
     } else if (!this.inheritCodexHome) {
@@ -292,4 +387,8 @@ function isWindowsCommandNotFoundLine(line: string): boolean {
     process.platform === 'win32' &&
     /is not recognized as an internal or external command|operable program or batch file/i.test(line)
   );
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

@@ -241,11 +241,11 @@ function isSignedBridgeCallback(payload: Record<string, unknown>): boolean {
  * string the text-command handler expects: 'use proj-a'. Accepts `arg`
  * (preferred, generic) or `name` (legacy ws cards). */
 function composeArgs(sub: string, payload: Record<string, unknown>): string {
-  if (!sub) return '';
   const arg =
     (typeof payload.arg === 'string' && payload.arg) ||
     (typeof payload.name === 'string' && payload.name) ||
     '';
+  if (!sub) return arg;
   return arg ? `${sub} ${arg}` : sub;
 }
 

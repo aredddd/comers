@@ -49,7 +49,7 @@ export function buildUnit(inputs: UnitInputs): string {
   // them unquoted is fine.
   const runArgs = inputs.runArgs.join(' ');
   return `[Unit]
-Description=Lark Channel Bridge bot
+Description=Comers bot
 After=network-online.target
 Wants=network-online.target
 

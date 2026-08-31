@@ -29,8 +29,8 @@ import { runUi } from './commands/ui';
 const program = new Command();
 
 program
-  .name('lark-channel-bridge')
-  .description('Bridge Feishu/Lark messenger with local CLI coding agents')
+  .name('comers')
+  .description('Use Feishu/Lark as a mobile client for local Codex tasks')
   .version(pkg.version, '-v, --version');
 
 // === process-level commands (work directly on bridge processes) ===

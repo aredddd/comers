@@ -47,7 +47,13 @@ describe('static architecture contracts', () => {
   });
 
   it('persists profile runtime state through atomic 0600 writes', () => {
-    for (const file of ['src/session/store.ts', 'src/workspace/store.ts', 'src/card/callback-store.ts']) {
+    for (const file of [
+      'src/session/store.ts',
+      'src/workspace/store.ts',
+      'src/card/callback-store.ts',
+      'src/bot/message-ledger.ts',
+      'src/scheduler/manager.ts',
+    ]) {
       const source = read(file);
       expect(source, file).toContain('writeFileAtomic');
       expect(source, file).toContain('mode: 0o600');

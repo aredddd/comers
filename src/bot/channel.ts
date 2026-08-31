@@ -62,6 +62,7 @@ import { recordRunSessionEvent, startRunFlow } from './run-flow';
 import { commandSessionCatalogIdentity } from './session-catalog-identity';
 import { startKeepalive } from './keepalive';
 import { PendingQueue } from './pending-queue';
+import { MessageLedger } from './message-ledger';
 import { ProcessPool } from './process-pool';
 import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quote';
 import { lookupMessageThreadId } from './thread-id';
@@ -74,6 +75,7 @@ import {
   CotPublisher,
   finalAnswerOnlyState,
 } from './cot';
+import { SchedulerManager, type ScheduledRunStatus } from '../scheduler/manager';
 
 const DEBOUNCE_MS = 600;
 const STREAM_TERMINAL_GRACE_MS = 3000;
@@ -201,6 +203,10 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     ? new CallbackNonceStore(join(dirname(deps.appPaths.mediaDir), 'callback-nonces.json'))
     : undefined;
   await callbackNonceStore?.load();
+  const messageLedger = deps.appPaths?.mediaDir
+    ? new MessageLedger(join(dirname(deps.appPaths.mediaDir), 'message-ledger.json'))
+    : undefined;
+  await messageLedger?.load();
   const callbackAuth = callbackNonceStore
     ? new CallbackAuth({
         keys: [{ version: 1, secret: appSecret }],
@@ -323,17 +329,67 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       } catch (err) {
         log.fail('flush', err);
       } finally {
+        for (const message of batch) messageLedger?.markDone(message.messageId);
         pending.unblock(scope);
         log.info('flush', 'end');
       }
     });
   });
 
+  const scheduler = deps.appPaths?.mediaDir
+    ? new SchedulerManager(
+        join(dirname(deps.appPaths.mediaDir), 'scheduled-jobs.json'),
+        async (job, scheduledRun) => {
+          const anchor = await channel.send(job.chatId, {
+            markdown: `⏰ 定时任务 **${job.name.replace(/([*_`\\])/g, '\\$1')}** 开始执行…`,
+          });
+          if (!anchor.messageId) throw new Error('定时任务启动消息没有 message id');
+          const synthetic: NormalizedMessage = {
+            messageId: anchor.messageId,
+            chatId: job.chatId,
+            chatType: job.chatType,
+            threadId: job.threadId,
+            senderId: job.actorId,
+            content: `[定时任务：${job.name}]\n${job.prompt}`,
+            rawContentType: `scheduled_job:${job.id}:${scheduledRun.id}`,
+            resources: [],
+            mentions: [],
+            mentionAll: false,
+            mentionedBot: true,
+            createTime: Date.now(),
+          };
+          if (messageLedger && !messageLedger.claim(synthetic)) {
+            log.info('scheduler', 'duplicate-anchor', { id: job.id, msgId: synthetic.messageId });
+            return;
+          }
+          pending.push(job.runScopeId ?? job.scopeId, synthetic);
+          messageLedger?.markQueued(synthetic.messageId);
+          // Do not let SchedulerManager advance a one-shot/recurring job until
+          // its queued work is durably recoverable.
+          await messageLedger?.flush();
+        },
+      )
+    : undefined;
+  await scheduler?.load();
+  if (scheduler) {
+    const recoverableRunIds = new Set(
+      (messageLedger?.recoverable() ?? [])
+        .map((message) => scheduledMessageRef(message.rawContentType)?.runId)
+        .filter((runId): runId is string => Boolean(runId)),
+    );
+    await scheduler.reconcileRecoverableRuns(recoverableRunIds);
+  }
+  controls.scheduler = scheduler;
+
   // Counter for stdout reconnect escalation; reset on `reconnected`.
   let consecutiveReconnects = 0;
 
   channel.on({
     message: async (msg) => {
+      if (messageLedger && !messageLedger.claim(msg)) {
+        log.info('intake', 'duplicate', { msgId: msg.messageId, chatId: msg.chatId });
+        return;
+      }
       await withTrace({ chatId: msg.chatId, msgId: msg.messageId }, () =>
         intakeMessage({
           channel,
@@ -349,8 +405,13 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           logThreadModeOverride,
           executor,
           pool,
+          messageLedger,
         }),
-      ).catch((err) => log.fail('intake', err));
+      ).then((disposition) => {
+        if (!messageLedger) return;
+        if (disposition === 'queued') messageLedger.markQueued(msg.messageId);
+        else messageLedger.markDone(msg.messageId);
+      }).catch((err) => log.fail('intake', err));
     },
     reject: (evt) => {
       log.info('intake', 'reject', { chatId: evt.chatId, reason: evt.reason });
@@ -466,6 +527,39 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   }
 
   await channel.connect();
+  scheduler?.start();
+  if (messageLedger) {
+    const recovered = messageLedger.recoverable();
+    if (recovered.length > 0) {
+      log.warn('message-ledger', 'recovering', { count: recovered.length });
+      for (const msg of recovered) {
+        const disposition = await intakeMessage({
+          channel,
+          agent,
+          sessions,
+          sessionCatalog,
+          workspaces,
+          activeRuns,
+          pending,
+          msg,
+          controls,
+          chatModeCache,
+          logThreadModeOverride,
+          executor,
+          pool,
+          messageLedger,
+        }).catch((error) => {
+          log.warn('message-ledger', 'recover-failed', {
+            msgId: msg.messageId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return undefined;
+        });
+        if (disposition === 'queued') messageLedger.markQueued(msg.messageId);
+        else if (disposition === 'done') messageLedger.markDone(msg.messageId);
+      }
+    }
+  }
   const ownerRefresh = createOwnerRefreshController({
     controls,
     source: channel,
@@ -518,13 +612,17 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
       // reconnect would be surprising.
       meetingManager?.dispose();
       controls.meeting = undefined;
+      scheduler?.stop();
+      controls.scheduler = undefined;
       pending.cancelAll();
       const [disconnectResult, stopAllResult, ...flushResults] = await Promise.allSettled([
         channel.disconnect(),
-        activeRuns.stopAll(),
+        activeRuns.stopAll().then(() => agent.close?.()),
         sessions.flush(),
         sessionCatalog?.flush(),
         callbackNonceStore?.flush(),
+        messageLedger?.flush(),
+        scheduler?.flush(),
         workspaces.flush(),
       ]);
       if (stopAllResult.status === 'rejected') {
@@ -596,6 +694,36 @@ function isForwardFetchFailed(msg: NormalizedMessage): boolean {
   );
 }
 
+function scheduledMessageRef(rawContentType: string): {
+  jobId: string;
+  runId?: string;
+} | undefined {
+  if (!rawContentType.startsWith('scheduled_job:')) return undefined;
+  const [jobId, runId] = rawContentType.slice('scheduled_job:'.length).split(':', 2);
+  if (!jobId) return undefined;
+  return { jobId, ...(runId ? { runId } : {}) };
+}
+
+type ScheduledTerminalStatus = Extract<
+  ScheduledRunStatus,
+  'succeeded' | 'failed' | 'interrupted' | 'timed_out'
+>;
+
+function scheduledRunOutcome(
+  state: RunState | undefined,
+  failure: string | undefined,
+): { status: ScheduledTerminalStatus; error?: string } {
+  if (failure) return { status: 'failed', error: failure };
+  if (!state) return { status: 'failed', error: 'Codex 运行结束但没有终态记录' };
+  if (state.terminal === 'done') return { status: 'succeeded' };
+  if (state.terminal === 'interrupted') return { status: 'interrupted' };
+  if (state.terminal === 'idle_timeout') return { status: 'timed_out' };
+  if (state.terminal === 'error') {
+    return { status: 'failed', error: state.errorMsg ?? 'Codex 运行失败' };
+  }
+  return { status: 'failed', error: 'Codex 运行未产生终态' };
+}
+
 async function sendForwardFetchFailedHint(
   channel: LarkChannel,
   chatId: string,
@@ -625,6 +753,7 @@ interface IntakeDeps {
   logThreadModeOverride: LogThreadModeOverride;
   executor: RunExecutor;
   pool: ProcessPool;
+  messageLedger?: MessageLedger;
 }
 
 type LogThreadModeOverride = (input: {
@@ -633,7 +762,7 @@ type LogThreadModeOverride = (input: {
   threadId: string;
 }) => void;
 
-async function intakeMessage(deps: IntakeDeps): Promise<void> {
+async function intakeMessage(deps: IntakeDeps): Promise<'queued' | 'done'> {
   const {
     channel,
     agent,
@@ -648,6 +777,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     logThreadModeOverride,
     executor,
     pool,
+    messageLedger,
   } = deps;
   const preview = msg.content.length > 80 ? `${msg.content.slice(0, 80)}…` : msg.content;
   // Resolve scope (and underlying chat mode) once at intake — every
@@ -687,9 +817,12 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
       threadId,
     });
   }
-  const scope = chatMode === 'topic' && threadId
+  const conversationScope = chatMode === 'topic' && threadId
     ? `${msg.chatId}:${threadId}`
     : msg.chatId;
+  const scheduledJobId = scheduledMessageRef(msg.rawContentType)?.jobId;
+  const scheduledJob = scheduledJobId ? controls.scheduler?.get(scheduledJobId) : undefined;
+  const scope = scheduledJob?.runScopeId ?? conversationScope;
   log.info('intake', 'enter', {
     scope,
     chatType: msg.chatType,
@@ -717,7 +850,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
         log.warn('intake', 'non-allowed-hint-failed', { err: String(err) }),
       );
     }
-    return;
+    return 'done';
   }
 
   // Group-mention policy. p2p is always unrestricted; in groups (regular and
@@ -735,7 +868,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     !msg.mentionedBot
   ) {
     log.info('intake', 'skip-no-mention', { scope, chatType: msg.chatType });
-    return;
+    return 'done';
   }
 
   // A merge_forward whose sub-messages the SDK could not fetch (transient
@@ -752,7 +885,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
     await sendForwardFetchFailedHint(channel, emsg.chatId, emsg.messageId).catch((err) =>
       log.warn('intake', 'forward-fetch-failed-hint-failed', { err: String(err) }),
     );
-    return;
+    return 'done';
   }
 
   const handled = await tryHandleCommand({
@@ -779,12 +912,14 @@ async function intakeMessage(deps: IntakeDeps): Promise<void> {
   });
   if (handled) {
     const dropped = pending.cancel(scope);
+    for (const pendingMessage of dropped) messageLedger?.markDone(pendingMessage.messageId);
     log.info('intake', 'command', { scope, droppedPending: dropped.length });
-    return;
+    return 'done';
   }
 
   const size = pending.push(scope, emsg);
   log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
+  return 'queued';
 }
 
 interface RunBatchDeps {
@@ -825,6 +960,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const firstMsg = batch[0];
   const lastMsg = batch[batch.length - 1];
   if (!firstMsg || !lastMsg) return;
+  const scheduledRef = scheduledMessageRef(firstMsg.rawContentType);
 
   const chatId = firstMsg.chatId;
   const threadId = firstMsg.threadId;
@@ -832,7 +968,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const resourceItems = batch.flatMap((m) =>
     m.resources.map((r) => ({ messageId: m.messageId, resource: r })),
   );
-  const attachments = await media.resolve(resourceItems, controls.profileConfig.attachments);
+  const attachments = await media.resolve(resourceItems, {
+    ...controls.profileConfig.attachments,
+    acceptAudio: controls.profileConfig.agentKind === 'codex',
+  });
   if (attachments.length > 0) {
     log.info('media', 'resolved', { count: attachments.length });
     for (const attachment of attachments) {
@@ -972,6 +1111,12 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
     workspaces,
     executor,
     now: Date.now(),
+    deliveryContext: {
+      chatId,
+      messageId: lastMsg.messageId,
+      chatType: firstMsg.chatType,
+      ...(threadId ? { threadId } : {}),
+    },
     stopGraceMs: getAgentStopGraceMs(controls.cfg),
     observability: {
       profile: controls.profile,
@@ -988,6 +1133,13 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       code: flow.rejectReason.code,
     });
     await channel.send(chatId, { markdown: flow.rejectReason.userVisible }, sendOpts);
+    if (scheduledRef?.runId) {
+      await controls.scheduler?.finishRun(
+        scheduledRef.runId,
+        'failed',
+        flow.rejectReason.userVisible,
+      );
+    }
     return;
   }
 
@@ -995,6 +1147,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   activePolicyFingerprints.set(scope, flow.policy.policyFingerprint);
   const handle = execution.handle;
   const eventStream = execution.subscribe();
+  if (scheduledRef?.runId) {
+    await controls.scheduler?.markRunning(scheduledRef.runId);
+  }
   if (flow.resumeFrom) {
     log.info('session', 'resume', { sessionId: flow.resumeFrom, cwd });
   } else {
@@ -1065,6 +1220,33 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           }),
       }
     : {};
+  const standaloneApprovalCards = new Set<string>();
+  const handleControlEvent = async (event: AgentEvent): Promise<void> => {
+    if (
+      replyMode === 'card' ||
+      event.type !== 'approval_request' ||
+      standaloneApprovalCards.has(event.request.id)
+    ) return;
+    try {
+      await channel.send(
+        chatId,
+        {
+          card: renderCard(
+            { ...initialState, approvals: [event.request], footer: null },
+            cardRenderOptions,
+          ),
+        },
+        sendOpts,
+      );
+      standaloneApprovalCards.add(event.request.id);
+    } catch (error) {
+      log.warn('approval', 'card-send-failed-declining', {
+        requestId: event.request.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      await handle.run.respondToRequest?.(event.request.id, 'decline');
+    }
+  };
 
   // For non-card modes Claude's output doesn't surface visually until either
   // a first streamed token (markdown mode) or the whole run ends (text mode).
@@ -1073,6 +1255,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const reactionPromise =
     cotEnabled || replyMode === 'card' ? undefined : addWorkingReaction(channel, lastMsg.messageId);
 
+  let scheduledFinalState: RunState | undefined;
+  let scheduledFailure: string | undefined;
   try {
     if (cotEnabled) {
       const cotPublisher = new CotPublisher({
@@ -1099,7 +1283,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           idleTimeoutMs,
           recordSession,
           async () => {},
+          handleControlEvent,
         );
+        scheduledFinalState = finalState;
         await cotDone;
         if (cotPublisher.degradedReason) {
           await sendCotDegradedNotice({
@@ -1161,6 +1347,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             await cardCtrl.update(renderCard(filterForPrefs(state), cardRenderOptions));
           }
         },
+        handleControlEvent,
       );
       try {
         await awaitRenderAwareStream({
@@ -1182,6 +1369,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         if (controls.profileConfig.agentKind !== 'codex') throw err;
         log.fail('stream', err, { mode: replyMode, step: 'progress-stream' });
       }
+      scheduledFinalState = latestState;
       await recallIfEmptyStreamedReply(channel, progress, filterForPrefs(latestState), scope);
       if (controls.profileConfig.agentKind === 'codex') {
         await sendFinalReply({
@@ -1226,6 +1414,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             await markdownCtrl.setContent(renderText(filterForPrefs(state)));
           }
         },
+        handleControlEvent,
       );
       try {
         await awaitRenderAwareStream({
@@ -1245,6 +1434,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         if (controls.profileConfig.agentKind !== 'codex') throw err;
         log.fail('stream', err, { mode: replyMode, step: 'progress-stream' });
       }
+      scheduledFinalState = latestState;
       await recallIfEmptyStreamedReply(channel, progress, filterForPrefs(latestState), scope);
       if (controls.profileConfig.agentKind === 'codex') {
         await sendFinalReply({
@@ -1268,7 +1458,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         idleTimeoutMs,
         recordSession,
         async () => {},
+        handleControlEvent,
       );
+      scheduledFinalState = finalState;
       await sendFinalReply({
         channel,
         chatId,
@@ -1283,8 +1475,22 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       });
     }
   } catch (err) {
+    scheduledFailure = err instanceof Error ? err.message : String(err);
     log.fail('stream', err);
   } finally {
+    if (scheduledRef?.runId) {
+      const outcome = scheduledRunOutcome(scheduledFinalState, scheduledFailure);
+      await controls.scheduler?.finishRun(
+        scheduledRef.runId,
+        outcome.status,
+        outcome.error,
+      ).catch((error) => {
+        log.warn('scheduler', 'finish-run-failed', {
+          runId: scheduledRef.runId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
     activePolicyFingerprints.delete(scope);
     scheduleWorkingReactionCleanup(channel, lastMsg.messageId, reactionPromise);
   }
@@ -1363,6 +1569,7 @@ function createLazyProgressStream(
  */
 function shouldOpenProgressStream(state: RunState): boolean {
   if (state.terminal !== 'running') return false;
+  if ((state.approvals?.length ?? 0) > 0) return true;
   return renderText({ ...state, footer: null }).trim() !== '';
 }
 
@@ -1554,6 +1761,7 @@ async function processAgentStream(
   idleTimeoutMs: number | undefined,
   recordSession: (event: AgentEvent) => void,
   flush: (state: RunState) => Promise<void>,
+  onControlEvent?: (event: AgentEvent) => Promise<void>,
 ): Promise<RunState> {
   const runStart = Date.now();
   let state: RunState = initialState;
@@ -1575,11 +1783,12 @@ async function processAgentStream(
   let idleFired = false;
   let timer: NodeJS.Timeout | undefined;
   const inFlightTools = new Set<string>();
+  const pendingApprovals = new Set<string>();
   const armOrPauseIdle = (): void => {
     if (!idleTimeoutMs) return;
     if (timer) clearTimeout(timer);
     timer = undefined;
-    if (inFlightTools.size > 0) return;
+    if (inFlightTools.size > 0 || pendingApprovals.size > 0) return;
     timer = setTimeout(() => {
       idleFired = true;
       handle.interrupted = true;
@@ -1594,6 +1803,7 @@ async function processAgentStream(
   try {
     for await (const evt of events) {
       if (handle.interrupted) break;
+      await onControlEvent?.(evt);
 
       // Track tool flight before re-arming the idle timer so the arm step
       // sees the correct set size. tool_use opens a window; tool_result
@@ -1607,6 +1817,15 @@ async function processAgentStream(
       } else if (evt.type === 'tool_result') {
         inFlightTools.delete(evt.id);
         log.info('agent', 'tool-done', { inFlight: inFlightTools.size });
+      } else if (evt.type === 'approval_request') {
+        pendingApprovals.add(evt.request.id);
+        log.info('agent', 'approval-pending', {
+          kind: evt.request.kind,
+          pending: pendingApprovals.size,
+        });
+      } else if (evt.type === 'approval_resolved') {
+        pendingApprovals.delete(evt.requestId);
+        log.info('agent', 'approval-resolved', { pending: pendingApprovals.size });
       }
       armOrPauseIdle();
 

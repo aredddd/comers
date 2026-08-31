@@ -71,7 +71,7 @@ describe('CodexAdapter process contract', () => {
     expect(record.argv).not.toContain('--ignore-user-config');
     expect(record.argv).toContain('--skip-git-repo-check');
     expect(record.argv).not.toContain('hello from lark');
-    expect(record.stdin).toContain('lark-channel-bridge 运行约定');
+    expect(record.stdin).toContain('Comers 运行约定');
     expect(record.stdin).toContain('__bridge_cb');
     expect(record.stdin).toContain('lark-cli auth login');
     expect(record.stdin).toContain('LARK_CHANNEL_PROFILE');
@@ -111,6 +111,12 @@ describe('CodexAdapter process contract', () => {
       runId: 'run-profile-env',
       prompt: 'profile',
       cwd: await realpath(fake.dir),
+      deliveryContext: {
+        chatId: 'oc_current',
+        messageId: 'om_trigger',
+        chatType: 'group',
+        threadId: 'omt_topic',
+      },
     });
 
     await collect(run.events);
@@ -122,6 +128,10 @@ describe('CodexAdapter process contract', () => {
       LARK_CHANNEL_HOME: rootDir,
       LARK_CHANNEL_CONFIG: larkCliSourceConfigFile,
       LARKSUITE_CLI_CONFIG_DIR: larkCliConfigDir,
+      LARK_CHANNEL_CHAT_ID: 'oc_current',
+      LARK_CHANNEL_MESSAGE_ID: 'om_trigger',
+      LARK_CHANNEL_CHAT_TYPE: 'group',
+      LARK_CHANNEL_THREAD_ID: 'omt_topic',
       CODEX_HOME: '/outer/codex-home',
     });
   });
@@ -452,6 +462,10 @@ async function createFakeCodex(options: {
       '      LARK_CHANNEL_HOME: process.env.LARK_CHANNEL_HOME,',
       '      LARK_CHANNEL_CONFIG: process.env.LARK_CHANNEL_CONFIG,',
       '      LARKSUITE_CLI_CONFIG_DIR: process.env.LARKSUITE_CLI_CONFIG_DIR,',
+      '      LARK_CHANNEL_CHAT_ID: process.env.LARK_CHANNEL_CHAT_ID,',
+      '      LARK_CHANNEL_MESSAGE_ID: process.env.LARK_CHANNEL_MESSAGE_ID,',
+      '      LARK_CHANNEL_CHAT_TYPE: process.env.LARK_CHANNEL_CHAT_TYPE,',
+      '      LARK_CHANNEL_THREAD_ID: process.env.LARK_CHANNEL_THREAD_ID,',
       '      CODEX_HOME: process.env.CODEX_HOME,',
       '      APP_SECRET: process.env.APP_SECRET,',
       '      PATH: process.env.PATH,',
@@ -479,6 +493,10 @@ async function readRecord(path: string): Promise<{
     LARK_CHANNEL_HOME?: string;
     LARK_CHANNEL_CONFIG?: string;
     LARKSUITE_CLI_CONFIG_DIR?: string;
+    LARK_CHANNEL_CHAT_ID?: string;
+    LARK_CHANNEL_MESSAGE_ID?: string;
+    LARK_CHANNEL_CHAT_TYPE?: string;
+    LARK_CHANNEL_THREAD_ID?: string;
     CODEX_HOME?: string;
     APP_SECRET?: string;
     PATH?: string;
@@ -494,6 +512,10 @@ async function readRecord(path: string): Promise<{
       LARK_CHANNEL_HOME?: string;
       LARK_CHANNEL_CONFIG?: string;
       LARKSUITE_CLI_CONFIG_DIR?: string;
+      LARK_CHANNEL_CHAT_ID?: string;
+      LARK_CHANNEL_MESSAGE_ID?: string;
+      LARK_CHANNEL_CHAT_TYPE?: string;
+      LARK_CHANNEL_THREAD_ID?: string;
       CODEX_HOME?: string;
       APP_SECRET?: string;
       PATH?: string;

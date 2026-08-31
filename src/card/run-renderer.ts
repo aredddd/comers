@@ -1,6 +1,7 @@
 import { deepMaskEmails } from './mask-email';
 import type { Block, FooterStatus, RunState, ToolEntry } from './run-state';
 import { toolBodyMd, toolHeaderText } from './tool-render';
+import type { AgentApprovalRequest } from '../agent/types';
 
 const REASONING_MAX = 1500;
 const COLLAPSE_TOOL_THRESHOLD = 3;
@@ -36,6 +37,10 @@ export function renderCard(state: RunState, options: RunCardRenderOptions = {}):
     }
   }
 
+  for (const approval of state.approvals ?? []) {
+    elements.push(approvalPanel(approval, options));
+  }
+
   if (state.terminal === 'interrupted') {
     elements.push(noteMd('_⏹ 已被中断_'));
   } else if (state.terminal === 'idle_timeout') {
@@ -62,6 +67,103 @@ export function renderCard(state: RunState, options: RunCardRenderOptions = {}):
     },
     body: { elements },
   });
+}
+
+function approvalPanel(
+  request: AgentApprovalRequest,
+  options: RunCardRenderOptions,
+): object {
+  const details = [
+    request.reason ? `**原因**：${escapeMd(request.reason)}` : '',
+    request.cwd ? `**目录**：\`${escapeCode(request.cwd)}\`` : '',
+    request.command ? `**命令**\n\`\`\`bash\n${truncate(request.command, 1000)}\n\`\`\`` : '',
+    request.detail ? truncate(request.detail, 1000) : '',
+    ...((request.questions ?? []).map((question) => {
+      const optionsText = question.options?.length
+        ? `\n${question.options.map((option) => `- ${escapeMd(option.label)}${option.description ? `：${escapeMd(option.description)}` : ''}`).join('\n')}`
+        : '';
+      return `**${escapeMd(question.header)}**：${escapeMd(question.question)}${optionsText}`;
+    })),
+  ].filter(Boolean);
+  if (request.url) details.push(`**链接**：${request.url}`);
+  const questions = request.questions ?? [];
+  if (request.kind === 'user-input' && questions.some((question) => question.isSecret)) {
+    details.push('此请求包含敏感输入，不建议在飞书中提交；请拒绝后改用不含秘密的方式继续。');
+  } else if (request.kind === 'user-input' && questions.length > 1) {
+    const example = Object.fromEntries(questions.map((question) => [question.id, '回答']));
+    details.push(`请一次性回复：\`/answer ${request.id} ${escapeCode(JSON.stringify(example))}\``);
+  } else if (request.kind === 'user-input' && !questions.some((q) => q.options?.length)) {
+    details.push(`请回复：\`/answer ${request.id} <你的回答>\``);
+  } else if (request.kind === 'mcp-elicitation' && !request.url) {
+    details.push(`如需提交结构化内容，请回复：\`/answer ${request.id} <JSON>\``);
+  }
+
+  const buttons: object[] = [];
+  const optionButtons = questions.length === 1 && !questions[0]?.isSecret
+    ? questions.flatMap((question) =>
+    (question.options ?? []).slice(0, 5).map((option) =>
+      approvalButton(
+        option.label,
+        'approval.answer',
+        `${request.id}:${encodeURIComponent(`${question.id}:${option.value}`)}`,
+        'primary',
+        options,
+      ),
+    ),
+  ) : [];
+  buttons.push(...optionButtons);
+  if (request.url) {
+    buttons.push({
+      tag: 'button',
+      text: { tag: 'plain_text', content: '打开授权链接' },
+      type: 'primary',
+      url: request.url,
+    });
+  }
+  if (request.kind !== 'user-input') {
+    buttons.push(approvalButton('允许一次', 'approval.accept', request.id, 'primary', options));
+    if (request.allowForSession) {
+      buttons.push(
+        approvalButton('本会话允许', 'approval.acceptForSession', request.id, 'default', options),
+      );
+    }
+  }
+  buttons.push(approvalButton('拒绝', 'approval.decline', request.id, 'danger', options));
+
+  return {
+    tag: 'column_set',
+    flex_mode: 'none',
+    background_style: 'grey',
+    columns: [{
+      tag: 'column',
+      width: 'weighted',
+      weight: 1,
+      elements: [
+        { tag: 'markdown', content: `🔐 **${escapeMd(request.title)}**\n\n${details.join('\n\n')}` },
+        { tag: 'button_group', buttons },
+      ],
+    }],
+  };
+}
+
+function approvalButton(
+  label: string,
+  cmd: string,
+  arg: string,
+  type: 'primary' | 'danger' | 'default',
+  options: RunCardRenderOptions,
+): object {
+  const value: Record<string, unknown> = { cmd, arg };
+  if (options.signCallback) {
+    value.__bridge_cb = true;
+    value.bridge_token = options.signCallback(cmd);
+  }
+  return {
+    tag: 'button',
+    text: { tag: 'plain_text', content: label },
+    type,
+    behaviors: [{ type: 'callback', value }],
+  };
 }
 
 function* groupBlocks(blocks: Block[]): Generator<Group> {
@@ -216,4 +318,12 @@ function summaryText(state: RunState): string {
 
 function truncate(s: string, max: number): string {
   return s.length > max ? `${s.slice(0, max)}…` : s;
+}
+
+function escapeMd(value: string): string {
+  return value.replace(/([*_`\\])/g, '\\$1');
+}
+
+function escapeCode(value: string): string {
+  return value.replace(/`/g, "'");
 }

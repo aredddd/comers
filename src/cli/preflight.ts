@@ -195,23 +195,13 @@ async function checkLarkCli(opts: PreFlightOptions): Promise<void> {
         }
       }
 
-      const showResult = await runCapture(
-        'lark-cli',
-        [...profileArgs, 'config', 'show'],
-        BIND_TIMEOUT_MS,
-        larkChannelEnv,
-      );
+      const showResult = await runLarkCliConfigShow(profileArgs, larkChannelEnv);
       if (showResult.success) return;
     }
   }
 
   if (!privateBinding) {
-    const showResult = await runCapture(
-      'lark-cli',
-      [...profileArgs, 'config', 'show'],
-      BIND_TIMEOUT_MS,
-      larkChannelEnv,
-    );
+    const showResult = await runLarkCliConfigShow(profileArgs, larkChannelEnv);
     if (showResult.success) return;
   }
 
@@ -220,8 +210,11 @@ async function checkLarkCli(opts: PreFlightOptions): Promise<void> {
     : privateBinding && shouldAttemptLocalUserImport(opts)
       ? await detectLocalSameAppUser(bridgeConfig, legacyLarkChannelEnv)
       : { status: 'not-needed' as const, reason: 'not-private-binding' };
-  const sBind = p.spinner();
-  sBind.start('Initializing lark-cli configuration');
+  // launchd/systemd tasks do not have a controlling terminal. @clack's
+  // spinner may try to open /dev/tty and block before the bot can connect,
+  // so only render it for an actual interactive run.
+  const sBind = canRenderPreflightSpinner(process.stdin.isTTY) ? p.spinner() : undefined;
+  sBind?.start('Initializing lark-cli configuration');
   const bindResult = await bindLarkCliWithCompatibility(
     profileArgs,
     larkChannelEnv,
@@ -230,7 +223,7 @@ async function checkLarkCli(opts: PreFlightOptions): Promise<void> {
     'bot-only',
   );
   if (!bindResult.success) {
-    sBind.error('lark-cli configuration failed');
+    sBind?.error('lark-cli configuration failed');
     if (privateBinding) {
       await persistLarkCliConfig(opts, {
         identityPreset: 'bot-only',
@@ -269,8 +262,12 @@ async function checkLarkCli(opts: PreFlightOptions): Promise<void> {
       });
     }
   }
-  sBind.stop('lark-cli configuration ready');
-  p.outro('Done');
+  sBind?.stop('lark-cli configuration ready');
+  if (process.stdin.isTTY) p.outro('Done');
+}
+
+export function canRenderPreflightSpinner(isTTY: boolean | undefined): boolean {
+  return isTTY === true;
 }
 
 async function bindLarkCliWithCompatibility(
@@ -383,12 +380,7 @@ async function privateSameAppUserReady(
   larkChannelEnv: NodeJS.ProcessEnv | undefined,
   cfg: AppConfig,
 ): Promise<boolean> {
-  const result = await runCapture(
-    'lark-cli',
-    [...profileArgs, 'config', 'show'],
-    BIND_TIMEOUT_MS,
-    larkChannelEnv,
-  );
+  const result = await runLarkCliConfigShow(profileArgs, larkChannelEnv);
   if (!result.success) return false;
   const parsed = parseJsonObject(result.output);
   if (!parsed || typeof parsed !== 'object') return false;
@@ -404,7 +396,7 @@ async function detectLocalSameAppUser(
   cfg: AppConfig,
   env?: NodeJS.ProcessEnv,
 ): Promise<{ status: LarkCliUserImportStatus; reason: string; users?: unknown }> {
-  const result = await runCapture('lark-cli', ['config', 'show'], BIND_TIMEOUT_MS, env);
+  const result = await runLarkCliConfigShow([], env);
   if (!result.success) return { status: 'failed', reason: 'local-config-show-failed' };
   const parsed = parseJsonObject(result.output);
   if (!parsed || typeof parsed !== 'object') {
@@ -615,7 +607,7 @@ function printBindFailedWarning(result: RunResult, appPaths?: AppPaths): void {
 
 function restartInstruction(profile?: string): string {
   const suffix = profile ? ` --profile ${profile}` : '';
-  return `Restart the current profile: lark-channel-bridge restart${suffix}; for foreground runs, press Ctrl+C and rerun lark-channel-bridge run${suffix}.`;
+  return `Restart the current profile: comers restart${suffix}; for foreground runs, press Ctrl+C and rerun comers run${suffix}.`;
 }
 
 function shouldUseLegacyLarkChannelSourceOverlay(output: string, appPaths: AppPaths): boolean {
@@ -715,6 +707,26 @@ interface RunResult {
   output: string;
 }
 
+function runLarkCliConfigShow(
+  profileArgs: string[],
+  env?: NodeJS.ProcessEnv,
+): Promise<RunResult> {
+  return runCapture(
+    'lark-cli',
+    [...profileArgs, 'config', 'show'],
+    BIND_TIMEOUT_MS,
+    env,
+    isValidLarkCliConfigShowOutput,
+  );
+}
+
+export function isValidLarkCliConfigShowOutput(output: string): boolean {
+  const parsed = parseJsonObject(output);
+  if (!parsed || typeof parsed !== 'object') return false;
+  const config = parsed as { appId?: unknown; brand?: unknown };
+  return typeof config.appId === 'string' && typeof config.brand === 'string';
+}
+
 /**
  * Run a child process, capture stdout/stderr to a buffer (keeps the
  * surrounding clack spinner UI clean), enforce a timeout. Used for the
@@ -725,21 +737,34 @@ async function runCapture(
   args: string[],
   timeoutMs: number,
   env?: NodeJS.ProcessEnv,
+  acceptOutput?: (output: string) => boolean,
 ): Promise<RunResult> {
   let captured = '';
   let timedOut = false;
+  let acceptedOutput = false;
 
   const exitCode = await new Promise<number | null>((resolve) => {
     const child = spawnProcess(cmd, args, {
       env: env ? mergeProcessEnv(process.env, env) : undefined,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    child.stdout?.on('data', (b: Buffer) => {
+    let acceptTimer: NodeJS.Timeout | undefined;
+    const capture = (b: Buffer): void => {
       captured += b.toString('utf8');
-    });
-    child.stderr?.on('data', (b: Buffer) => {
-      captured += b.toString('utf8');
-    });
+      if (!acceptOutput) return;
+      if (acceptTimer) clearTimeout(acceptTimer);
+      // Some lark-cli builds print a complete config and then keep an update
+      // checker handle alive. Treat a valid, quiet config payload as success
+      // and terminate that otherwise-idle child instead of delaying startup
+      // until the 30-second safety timeout.
+      acceptTimer = setTimeout(() => {
+        if (!acceptOutput(captured)) return;
+        acceptedOutput = true;
+        child.kill('SIGTERM');
+      }, 100);
+    };
+    child.stdout?.on('data', capture);
+    child.stderr?.on('data', capture);
 
     const timer = setTimeout(() => {
       timedOut = true;
@@ -748,13 +773,15 @@ async function runCapture(
 
     child.once('error', () => {
       clearTimeout(timer);
+      if (acceptTimer) clearTimeout(acceptTimer);
       resolve(null);
     });
     child.once('exit', (code) => {
       clearTimeout(timer);
+      if (acceptTimer) clearTimeout(acceptTimer);
       resolve(code);
     });
   });
 
-  return { success: !timedOut && exitCode === 0, output: captured };
+  return { success: acceptedOutput || (!timedOut && exitCode === 0), output: captured };
 }

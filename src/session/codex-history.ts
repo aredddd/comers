@@ -7,6 +7,7 @@ import {
   type SpawnedProcessByStdio,
 } from '../platform/spawn';
 import { normalizeSessionPreview } from './preview';
+import { CodexAppServerClient } from '../agent/codex/app-server-client';
 
 type CodexAppServerChild = SpawnedProcessByStdio<Writable, Readable, Readable>;
 
@@ -24,13 +25,18 @@ export interface CodexThreadHistoryEntry {
   cwd: string;
   createdAtMs: number;
   updatedAtMs: number;
+  recencyAtMs: number;
   source: string;
   name?: string;
+  status: 'active' | 'idle' | 'systemError' | 'notLoaded' | 'unknown';
+  isPinned: boolean;
+  gitBranch?: string;
 }
 
 export interface ListCodexThreadHistoryOptions {
   binary: string;
-  cwd: string;
+  /** Omit to list Codex tasks across every workspace, like `codex resume --all`. */
+  cwd?: string;
   limit: number;
   profileStateDir: string;
   codexHome?: string;
@@ -38,6 +44,27 @@ export interface ListCodexThreadHistoryOptions {
   timeoutMs?: number;
   sourceKinds?: readonly CodexThreadSourceKind[];
   useStateDbOnly?: boolean;
+  searchTerm?: string;
+  cursor?: string;
+}
+
+export interface CodexThreadHistoryPage {
+  entries: CodexThreadHistoryEntry[];
+  nextCursor?: string;
+}
+
+export interface CodexThreadTurnSummary {
+  turnId: string;
+  status: string;
+  startedAtMs?: number;
+  completedAtMs?: number;
+  userText?: string;
+  assistantText?: string;
+  tools: string[];
+}
+
+export interface CodexThreadDetail extends CodexThreadHistoryEntry {
+  turns: CodexThreadTurnSummary[];
 }
 
 export type CodexHistoryErrorCode =
@@ -67,15 +94,16 @@ const DEFAULT_SOURCE_KINDS: readonly CodexThreadSourceKind[] = [
 
 export async function listCodexThreadHistory(
   options: ListCodexThreadHistoryOptions,
-): Promise<CodexThreadHistoryEntry[]> {
+): Promise<CodexThreadHistoryPage> {
   const child = spawnCodexAppServer(options);
   const timeoutMs = options.timeoutMs ?? DEFAULT_HISTORY_TIMEOUT_MS;
   const stderrChunks: Buffer[] = [];
   let settled = false;
 
-  const result = await new Promise<CodexThreadHistoryEntry[]>((resolve, reject) => {
+  const result = await new Promise<CodexThreadHistoryPage>((resolve, reject) => {
     const rl = createInterface({ input: child.stdout, crlfDelay: Infinity });
     let timer: ReturnType<typeof setTimeout> | undefined;
+    let listRequested = false;
 
     const fail = (err: unknown): void => {
       if (settled) return;
@@ -119,7 +147,36 @@ export async function listCodexThreadHistory(
         return;
       }
       const response = recordValue(msg);
-      if (!response || response.id !== 2) return;
+      if (!response) return;
+      if (response.id === 1) {
+        if (response.error) {
+          const err = recordValue(response.error);
+          reject(
+            new CodexHistoryError(
+              'app-server-error',
+              typeof err?.message === 'string' ? err.message : 'codex app-server rejected initialization',
+            ),
+          );
+          cleanup({ kill: true });
+          return;
+        }
+        if (!listRequested) {
+          listRequested = true;
+          try {
+            child.stdin.write(
+              `${JSON.stringify(initializedNotification())}\n${JSON.stringify(listRequest(options))}\n`,
+              'utf8',
+              (err?: Error | null) => {
+                if (err) fail(err);
+              },
+            );
+          } catch (err) {
+            fail(err);
+          }
+        }
+        return;
+      }
+      if (response.id !== 2) return;
       if (response.error) {
         const err = recordValue(response.error);
         reject(
@@ -137,7 +194,7 @@ export async function listCodexThreadHistory(
         cleanup({ kill: true });
         return;
       }
-      resolve(parsed.entries);
+      resolve(parsed.page);
       cleanup({ kill: true });
     });
 
@@ -155,7 +212,7 @@ export async function listCodexThreadHistory(
 
     try {
       child.stdin.write(
-        `${JSON.stringify(initializeRequest())}\n${JSON.stringify(listRequest(options))}\n`,
+        `${JSON.stringify(initializeRequest())}\n`,
         'utf8',
         (err?: Error | null) => {
           if (err) fail(err);
@@ -168,6 +225,70 @@ export async function listCodexThreadHistory(
 
   await waitForChildExit(child, 250);
   return result;
+}
+
+export async function readCodexThreadDetail(
+  options: Omit<ListCodexThreadHistoryOptions, 'limit'> & { threadId: string },
+): Promise<CodexThreadDetail> {
+  const result = await codexAppServerRequest(options, 'thread/read', {
+    threadId: options.threadId,
+    includeTurns: true,
+  });
+  const raw = recordValue(result);
+  const thread = normalizeThread(raw?.thread);
+  const threadRaw = recordValue(raw?.thread);
+  if (!thread || !threadRaw) {
+    throw new CodexHistoryError('malformed-response', 'codex app-server returned malformed thread/read response');
+  }
+  return {
+    ...thread,
+    turns: Array.isArray(threadRaw.turns)
+      ? threadRaw.turns
+          .map(normalizeTurn)
+          .filter((turn): turn is CodexThreadTurnSummary => Boolean(turn))
+      : [],
+  };
+}
+
+export async function updateCodexThreadPinned(
+  options: Omit<ListCodexThreadHistoryOptions, 'limit'> & { threadId: string; isPinned: boolean },
+): Promise<void> {
+  await codexAppServerRequest(options, 'thread/metadata/update', {
+    threadId: options.threadId,
+    isPinned: options.isPinned,
+  });
+}
+
+export async function archiveCodexThread(
+  options: Omit<ListCodexThreadHistoryOptions, 'limit'> & { threadId: string },
+): Promise<void> {
+  await codexAppServerRequest(options, 'thread/archive', { threadId: options.threadId });
+}
+
+async function codexAppServerRequest(
+  options: Pick<
+    ListCodexThreadHistoryOptions,
+    'binary' | 'profileStateDir' | 'codexHome' | 'inheritCodexHome' | 'timeoutMs'
+  >,
+  method: string,
+  params: unknown,
+): Promise<unknown> {
+  const env: NodeJS.ProcessEnv = {};
+  if (options.codexHome) env.CODEX_HOME = options.codexHome;
+  else if (options.inheritCodexHome === false) env.CODEX_HOME = join(options.profileStateDir, 'codex-home');
+  const client = new CodexAppServerClient({
+    binary: options.binary,
+    cwd: options.profileStateDir,
+    env,
+    clientName: 'comers-task-manager',
+  });
+  const timeoutMs = options.timeoutMs ?? DEFAULT_HISTORY_TIMEOUT_MS;
+  try {
+    await withTimeout(client.connect(), timeoutMs, `codex ${method} connect timed out`);
+    return await withTimeout(client.request(method, params), timeoutMs, `codex ${method} timed out`);
+  } finally {
+    await client.close(250).catch(() => undefined);
+  }
 }
 
 function spawnCodexAppServer(options: ListCodexThreadHistoryOptions): CodexAppServerChild {
@@ -190,12 +311,19 @@ function initializeRequest() {
     id: 1,
     params: {
       clientInfo: {
-        name: 'lark-channel-bridge',
-        title: 'Lark Channel Bridge',
-        version: '0.2.3',
+        name: 'comers',
+        title: 'Comers',
+        version: '0.8.0',
       },
       capabilities: null,
     },
+  };
+}
+
+function initializedNotification() {
+  return {
+    method: 'initialized',
+    params: {},
   };
 }
 
@@ -205,11 +333,16 @@ function listRequest(options: ListCodexThreadHistoryOptions) {
     id: 2,
     params: {
       limit: options.limit,
-      sortKey: 'updated_at',
+      sortKey: 'recency_at',
       sortDirection: 'desc',
       archived: false,
-      cwd: options.cwd,
-      useStateDbOnly: options.useStateDbOnly ?? true,
+      ...(options.cwd ? { cwd: options.cwd } : {}),
+      // The desktop app can have rollout JSONL that has not been repaired into
+      // the state DB yet. Scan-and-repair is what makes the Feishu picker see
+      // the same task inventory as the desktop client.
+      useStateDbOnly: options.useStateDbOnly ?? false,
+      ...(options.searchTerm ? { searchTerm: options.searchTerm } : {}),
+      ...(options.cursor ? { cursor: options.cursor } : {}),
       sourceKinds: [...(options.sourceKinds ?? DEFAULT_SOURCE_KINDS)],
     },
   };
@@ -217,7 +350,7 @@ function listRequest(options: ListCodexThreadHistoryOptions) {
 
 function parseThreadListResponse(
   input: unknown,
-): { ok: true; entries: CodexThreadHistoryEntry[] } | { ok: false; error: CodexHistoryError } {
+): { ok: true; page: CodexThreadHistoryPage } | { ok: false; error: CodexHistoryError } {
   const raw = recordValue(input);
   if (!raw || !Array.isArray(raw.data)) {
     return {
@@ -227,7 +360,10 @@ function parseThreadListResponse(
   }
   return {
     ok: true,
-    entries: raw.data.map(normalizeThread).filter((entry): entry is CodexThreadHistoryEntry => Boolean(entry)),
+    page: {
+      entries: raw.data.map(normalizeThread).filter((entry): entry is CodexThreadHistoryEntry => Boolean(entry)),
+      ...(stringValue(raw.nextCursor) ? { nextCursor: stringValue(raw.nextCursor) } : {}),
+    },
   };
 }
 
@@ -239,6 +375,7 @@ function normalizeThread(input: unknown): CodexThreadHistoryEntry | undefined {
   if (!threadId || !cwd) return undefined;
   const createdAt = numberValue(raw.createdAt);
   const updatedAt = numberValue(raw.updatedAt);
+  const recencyAt = numberValue(raw.recencyAt);
   return {
     threadId,
     ...(stringValue(raw.sessionId) ? { sessionId: stringValue(raw.sessionId) } : {}),
@@ -246,9 +383,69 @@ function normalizeThread(input: unknown): CodexThreadHistoryEntry | undefined {
     cwd,
     createdAtMs: Math.round((createdAt ?? 0) * 1000),
     updatedAtMs: Math.round((updatedAt ?? 0) * 1000),
+    recencyAtMs: Math.round((recencyAt ?? updatedAt ?? createdAt ?? 0) * 1000),
     source: sourceValue(raw.source),
     ...(stringValue(raw.name) ? { name: stringValue(raw.name) } : {}),
+    status: statusValue(raw.status),
+    isPinned: raw.isPinned === true,
+    ...(stringValue(recordValue(raw.gitInfo)?.branch)
+      ? { gitBranch: stringValue(recordValue(raw.gitInfo)?.branch) }
+      : {}),
   };
+}
+
+function normalizeTurn(input: unknown): CodexThreadTurnSummary | undefined {
+  const raw = recordValue(input);
+  const turnId = stringValue(raw?.id);
+  if (!raw || !turnId) return undefined;
+  let userText = '';
+  let assistantText = '';
+  const tools: string[] = [];
+  if (Array.isArray(raw.items)) {
+    for (const candidate of raw.items) {
+      const item = recordValue(candidate);
+      if (!item) continue;
+      if (item.type === 'userMessage' && Array.isArray(item.content)) {
+        userText += item.content
+          .map((content) => {
+            const entry = recordValue(content);
+            return entry?.type === 'text' ? stringValue(entry.text) ?? '' : '';
+          })
+          .join('');
+      } else if (item.type === 'agentMessage') {
+        assistantText += stringValue(item.text) ?? '';
+      } else if (typeof item.type === 'string' && item.type !== 'reasoning') {
+        tools.push(item.type);
+      }
+    }
+  }
+  const startedAt = numberValue(raw.startedAt);
+  const completedAt = numberValue(raw.completedAt);
+  return {
+    turnId,
+    status: stringValue(raw.status) ?? 'unknown',
+    ...(startedAt !== undefined ? { startedAtMs: Math.round(startedAt * 1000) } : {}),
+    ...(completedAt !== undefined ? { completedAtMs: Math.round(completedAt * 1000) } : {}),
+    ...(userText.trim() ? { userText: normalizeSessionPreview(userText) } : {}),
+    ...(assistantText.trim() ? { assistantText: assistantText.trim() } : {}),
+    tools,
+  };
+}
+
+function withTimeout<T>(work: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new CodexHistoryError('timeout', message)), timeoutMs);
+    work.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
 }
 
 async function waitForChildExit(child: CodexAppServerChild, timeoutMs: number): Promise<void> {
@@ -268,6 +465,21 @@ async function waitForChildExit(child: CodexAppServerChild, timeoutMs: number): 
 function sourceValue(input: unknown): string {
   if (typeof input === 'string') return input;
   if (input && typeof input === 'object') return JSON.stringify(input);
+  return 'unknown';
+}
+
+function statusValue(
+  input: unknown,
+): CodexThreadHistoryEntry['status'] {
+  const type = stringValue(recordValue(input)?.type);
+  if (
+    type === 'active' ||
+    type === 'idle' ||
+    type === 'systemError' ||
+    type === 'notLoaded'
+  ) {
+    return type;
+  }
   return 'unknown';
 }
 

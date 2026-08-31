@@ -100,6 +100,26 @@ describe('run card renderer snapshots', () => {
     });
   });
 
+  it('does not render a non-functional accept button for multi-question user input', () => {
+    const state = stateFrom([{
+      type: 'approval_request',
+      request: {
+        id: 'request-1',
+        kind: 'user-input',
+        title: '需要你的选择',
+        questions: [
+          { id: 'first', header: '第一项', question: '选 A 还是 B？', options: [{ label: 'A', value: 'A' }] },
+          { id: 'second', header: '第二项', question: '选 C 还是 D？', options: [{ label: 'C', value: 'C' }] },
+        ],
+      },
+    }]);
+    const card = JSON.stringify(renderCard(state));
+    expect(card).toContain('/answer request-1');
+    expect(card).not.toContain('允许一次');
+    expect(card).not.toContain('approval.answer');
+    expect(card).toContain('拒绝');
+  });
+
   it('keeps local paths in user-visible cards and text fallbacks', () => {
     const sensitivePath = '/Users/example/private/customer/repo/secret.txt';
     const state = stateFrom([

@@ -53,7 +53,11 @@ vi.mock('../../../src/platform/spawn', () => ({
   spawnProcessSync: mocks.spawnProcessSync,
 }));
 
-const { preFlightChecks } = await import('../../../src/cli/preflight');
+const {
+  canRenderPreflightSpinner,
+  isValidLarkCliConfigShowOutput,
+  preFlightChecks,
+} = await import('../../../src/cli/preflight');
 const { resolveAppPaths } = await import('../../../src/config/app-paths');
 const { log } = await import('../../../src/core/logger');
 
@@ -123,6 +127,18 @@ describe('lark-cli preflight', () => {
   afterEach(async () => {
     vi.restoreAllMocks();
     await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+  });
+
+  it('does not render an interactive spinner for launchd and other non-TTY starts', () => {
+    expect(canRenderPreflightSpinner(undefined)).toBe(false);
+    expect(canRenderPreflightSpinner(false)).toBe(false);
+    expect(canRenderPreflightSpinner(true)).toBe(true);
+  });
+
+  it('only accepts complete lark-cli config show output for early non-TTY settlement', () => {
+    expect(isValidLarkCliConfigShowOutput('Config file path: /tmp/config.json\n{"appId":"cli_test","brand":"feishu"}')).toBe(true);
+    expect(isValidLarkCliConfigShowOutput('{"error":{"message":"not configured"}}')).toBe(false);
+    expect(isValidLarkCliConfigShowOutput('partial output')).toBe(false);
   });
 
   it('binds lark-cli into the bridge-private config dir when target config is missing', async () => {

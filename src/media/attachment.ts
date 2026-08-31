@@ -28,6 +28,8 @@ export interface AttachmentPolicyOptions {
   maxBytes: number;
   maxFileBytes: number;
   imageMaxBytes: number;
+  /** Codex App Server accepts localAudio inputs natively. */
+  acceptAudio: boolean;
 }
 
 const DEFAULT_POLICY: AttachmentPolicyOptions = {
@@ -35,6 +37,7 @@ const DEFAULT_POLICY: AttachmentPolicyOptions = {
   maxBytes: 100 * 1024 * 1024,
   maxFileBytes: 25 * 1024 * 1024,
   imageMaxBytes: 25 * 1024 * 1024,
+  acceptAudio: false,
 };
 
 const IMAGE_MIME_EXT: Record<string, string> = {
@@ -51,6 +54,12 @@ const MIME_EXT: Record<string, string> = {
   'text/plain': 'txt',
   'text/markdown': 'md',
   'application/json': 'json',
+  'audio/ogg': 'ogg',
+  'audio/opus': 'opus',
+  'audio/mpeg': 'mp3',
+  'audio/mp4': 'm4a',
+  'audio/wav': 'wav',
+  'audio/x-wav': 'wav',
 };
 
 export function normalizeAttachments(
@@ -67,7 +76,7 @@ export function normalizeAttachments(
       path: candidate.absPath,
       requiredness: 'optional' as const,
     };
-    const early = earlyDecision(candidate);
+    const early = earlyDecision(candidate, policy);
     if (early) return { ...base, ...early };
 
     if (acceptedCount >= policy.maxCount) {
@@ -122,11 +131,12 @@ export function toPromptAttachment(attachment: NormalizedAttachment): BridgeProm
 
 function earlyDecision(
   candidate: AttachmentCandidate,
+  policy: AttachmentPolicyOptions,
 ): Pick<NormalizedAttachment, 'decision' | 'rejectionReason'> | undefined {
   if (candidate.kind === 'sticker') {
     return { decision: 'skipped', rejectionReason: 'sticker' };
   }
-  if (candidate.kind === 'audio' || candidate.kind === 'video') {
+  if ((candidate.kind === 'audio' && !policy.acceptAudio) || candidate.kind === 'video') {
     return { decision: 'skipped', rejectionReason: 'unsupported-kind' };
   }
   if (candidate.kind === 'image' && !IMAGE_MIME_EXT[candidate.mime.toLowerCase()]) {

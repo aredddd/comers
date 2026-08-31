@@ -1,7 +1,10 @@
+import type { CodexThreadDetail } from '../session/codex-history';
+
 interface ButtonSpec {
   text: string;
   value: Record<string, unknown>;
   style?: 'primary' | 'danger' | 'default';
+  disabled?: boolean;
 }
 
 function button(spec: ButtonSpec): object {
@@ -10,6 +13,7 @@ function button(spec: ButtonSpec): object {
     text: { tag: 'plain_text', content: spec.text },
     type: spec.style ?? 'default',
     value: spec.value,
+    ...(spec.disabled ? { disabled: true } : {}),
   };
 }
 
@@ -65,6 +69,7 @@ export interface StatusInfo {
   profileName: string;
   cwd?: string;
   sessionId?: string;
+  sessionTitle?: string;
   emptySessionText?: string;
   sessionStale: boolean;
   agentName: string;
@@ -103,6 +108,7 @@ export function statusCard(info: StatusInfo): object {
     `🧩 **profile**: ${escapeMd(info.profileName)}`,
     `📁 **cwd**: ${cwdLine}`,
     `🔗 **session**: ${sessionLine}`,
+    ...(info.sessionTitle ? [`📝 **任务**: ${escapeMd(info.sessionTitle)}`] : []),
     `🤖 **agent**: ${escapeMd(info.agentName)}`,
     `🛡 **${escapeMd(info.runtimeAccess.label)}**: ${escapeMd(info.runtimeAccess.value)}`,
     ...(info.larkCliStatus ? [`🔐 **lark-cli**: ${info.larkCliStatus}`] : []),
@@ -139,17 +145,39 @@ export interface ResumeEntry {
   relTime: string;
   lineCount?: number;
   detail?: string;
+  workspace?: string;
   current?: boolean;
+  disabledReason?: string;
 }
 
-export function resumeCard(cwd: string, entries: ResumeEntry[]): object {
+export interface ResumeCardOptions {
+  globalCodex?: boolean;
+  query?: string;
+  nextPageArg?: string;
+}
+
+export function resumeCard(
+  cwd: string | undefined,
+  entries: ResumeEntry[],
+  options: ResumeCardOptions = {},
+): object {
   const elements: object[] = [];
-  elements.push(divMd(`当前 cwd：\`${escapeCode(cwd)}\``));
+  if (options.globalCodex) {
+    elements.push(divMd('范围：**本机 Codex 已有任务（跨项目）**'));
+    elements.push(divMd(`当前工作目录：\`${escapeCode(cwd ?? '(未设置)')}\``));
+    if (options.query) {
+      elements.push(divMd(`搜索：**${escapeMd(options.query)}**`));
+    }
+  } else {
+    elements.push(divMd(`当前 cwd：\`${escapeCode(cwd ?? '(未设置)')}\``));
+  }
 
   if (entries.length === 0) {
     elements.push(HR);
-    elements.push(divMd('此 cwd 下没有历史会话。'));
-    return shell('🔁 恢复历史会话', elements);
+    elements.push(
+      divMd(options.globalCodex ? '没有找到匹配的 Codex 任务。' : '此 cwd 下没有历史会话。'),
+    );
+    return shell(options.globalCodex ? '🧭 Codex 任务' : '🔁 恢复历史会话', elements);
   }
 
   elements.push(HR);
@@ -157,24 +185,93 @@ export function resumeCard(cwd: string, entries: ResumeEntry[]): object {
     const marker = e.current ? '  ← 当前' : '';
     const detail = e.detail ?? `${e.lineCount ?? 0} 条`;
     const displayId = e.displayId ?? e.sessionId;
+    const workspace = e.workspace
+      ? `\n📁 \`${escapeCode(e.workspace)}\``
+      : '';
+    const disabled = e.disabledReason
+      ? `\n⚠️ ${escapeMd(e.disabledReason)}`
+      : '';
     elements.push(
       divMd(
-        `**${i + 1}.** ${escapeMd(e.preview)}${marker}\n\`${displayId.slice(0, 8)}…\` · ${e.relTime} · ${escapeMd(detail)}`,
+        `**${i + 1}.** ${escapeMd(e.preview)}${marker}\n\`${displayId.slice(0, 8)}…\` · ${e.relTime} · ${escapeMd(detail)}${workspace}${disabled}`,
       ),
     );
     elements.push(
       actions([
         {
-          text: e.current ? '已是当前会话' : '▸ 恢复此会话',
+          text: e.current
+            ? '已是当前任务'
+            : e.disabledReason
+              ? '当前不可继续'
+              : '▸ 继续此任务',
           value: { cmd: 'resume.use', arg: e.sessionId },
-          style: e.current ? 'default' : 'primary',
+          style: e.current || e.disabledReason ? 'default' : 'primary',
+          ...(e.disabledReason ? { disabled: true } : {}),
         },
       ]),
     );
     if (i < entries.length - 1) elements.push(HR);
   });
 
-  return shell('🔁 恢复历史会话', elements);
+  if (options.nextPageArg) {
+    elements.push(HR);
+    elements.push(
+      actions([
+        {
+          text: '下一页 ›',
+          value: { cmd: 'resume.more', arg: options.nextPageArg },
+          style: 'primary',
+        },
+      ]),
+    );
+  }
+
+  return shell(options.globalCodex ? '🧭 Codex 任务' : '🔁 恢复历史会话', elements);
+}
+
+export function taskCard(task: CodexThreadDetail): object {
+  const title = task.name || task.preview || '(空任务)';
+  const turns = task.turns.slice(-8);
+  const elements: object[] = [
+    divMd(
+      [
+        `**${escapeMd(title)}**`,
+        `ID：\`${escapeCode(task.threadId)}\``,
+        `目录：\`${escapeCode(task.cwd)}\``,
+        task.gitBranch ? `分支：\`${escapeCode(task.gitBranch)}\`` : '',
+        `来源：${escapeMd(task.source)} · 状态：${escapeMd(task.status)}${task.isPinned ? ' · 📌 已置顶' : ''}`,
+      ].filter(Boolean).join('\n'),
+    ),
+  ];
+  if (turns.length > 0) {
+    elements.push(HR, divMd('**最近对话**'));
+    turns.forEach((turn, index) => {
+      const user = truncateLine(turn.userText ?? '(无用户文本)', 280);
+      const assistant = truncateLine(turn.assistantText ?? '(无回复文本)', 500);
+      const tools = turn.tools.length ? `\n🧰 ${turn.tools.map(escapeMd).join('、')}` : '';
+      elements.push(
+        divMd(
+          `**${index + 1}. 你**：${escapeMd(user)}\n**Codex**：${escapeMd(assistant)}${tools}`,
+        ),
+      );
+      if (index < turns.length - 1) elements.push(HR);
+    });
+  } else {
+    elements.push(HR, divMd('暂无可显示的 turn 历史。'));
+  }
+  elements.push(
+    HR,
+    actions([
+      {
+        text: task.isPinned ? '取消置顶' : '📌 置顶',
+        value: { cmd: task.isPinned ? 'task.unpin' : 'task.pin' },
+        style: task.isPinned ? 'default' : 'primary',
+      },
+      { text: '🗄️ 归档…', value: { cmd: 'task.archive' }, style: 'danger' },
+      { text: '刷新', value: { cmd: 'task' } },
+    ]),
+  );
+  return shell('🧭 Codex 任务详情', elements);
 }
 
 export function helpCard(agentName = 'Agent'): object {
@@ -186,13 +283,21 @@ export function helpCard(agentName = 'Agent'): object {
         '',
         '- `/new` `/reset` — 清空当前 chat 的会话',
         '- `/new chat [name]` — 新建群+新会话，自动拉你进群',
-        '- `/resume [N]` — 列出并恢复历史会话（最多 N 条）',
+        '- `/resume [N]` — Codex 跨项目列出本机已有任务（最多 N 条）',
+        '- `/resume search <关键词>` — 按 Codex 任务标题搜索',
+        '- `/task` — 查看当前 Codex 任务详情与最近 turn',
+        '- `/pin [on|off]` — 置顶/取消置顶当前 Codex 任务',
+        '- `/archive` — 二次确认后归档当前 Codex 任务',
+        '- `/handoff <thread-id>` — 把桌面/CLI Codex 任务接到当前私聊',
+        '- `/cron help` — 创建、暂停、恢复和立即运行持久化定时任务',
         '- `/cd <path>` — 切换工作目录（会重置 session）',
         '- `/ws list|save <name>|use <name>|remove <name>` — 工作目录',
         '- `/account` — 查看当前应用；`/account change` 换 appId/secret 并重连',
         '- `/config` — 调整偏好、访问控制和 lark-cli 身份策略',
         '- `/status` — 当前状态',
         '- `/stop` — 结束当前正在跑的任务（也可点卡片底部 ⏹ 终止 按钮）',
+        '- `/steer <内容>` — 运行中追加指示，不重开 turn（Codex App Server）',
+        '- `/answer <请求ID> <回答>` — 回答 Codex 的自由文本问题',
         '- `/stop comment:<scopeHash>` — 管理员停止云文档评论任务',
         '- `/timeout [N|off|default]` — 当前 session 的探活分钟数,`/config` 改全局默认',
         '- `/timeout comment:<scopeHash> N` — 管理员设置云文档评论任务探活',
@@ -221,4 +326,9 @@ function escapeMd(s: string): string {
 
 function escapeCode(s: string): string {
   return s.replace(/`/g, "'");
+}
+
+function truncateLine(value: string, max: number): string {
+  const oneLine = value.replace(/\s+/g, ' ').trim();
+  return oneLine.length > max ? `${oneLine.slice(0, max)}…` : oneLine;
 }

@@ -1,6 +1,8 @@
-# lark-channel-bridge
+# Comers
 
-A lightweight bot that bridges Feishu / Lark messenger with your local Claude Code or Codex CLI. Run one command, scan a QR code to bind a PersonalAgent app, and talk to your local coding agent from chat.
+A lightweight gateway that turns Feishu / Lark into a mobile client for Codex, with Claude Code compatibility. Comers owns transport, task routing, scheduling, and artifact delivery; Codex remains the source of truth for sessions, harness rules, skills, MCP, and tool execution.
+
+This project is derived from the MIT-licensed [`lark-coding-agent-bridge`](https://github.com/zarazhangrui/lark-coding-agent-bridge) and extends it for Codex App Server, native task management, and personal use. See [NOTICE.md](./NOTICE.md).
 
 [中文 README](./README.zh.md)
 
@@ -12,9 +14,11 @@ For a product walkthrough, see the [Feishu document](https://larkcommunity.feish
 - **Streaming card**: text replies and tool calls update on one Lark card in real time.
 - **COT process messages**: optionally send a process message with agent progress text and tool calls, then send the final answer separately.
 - **Session continuity**: each chat, topic, or document comment thread keeps its own session.
+- **Codex mobile-client mode**: a persistent Codex App Server connection resumes real desktop/CLI tasks and exposes recent turns, pinning, archiving, approvals, steering, and native interruption.
 - **Queueing and batching**: messages sent in quick succession are handled together; messages sent during a run are queued for the next turn, while commands like `/new`, `/cd`, `/ws use`, and `/stop` can interrupt the current task.
 - **Multiple workspaces**: use `/cd` to switch the current project, and `/ws` to save and reuse common project directories.
-- **Images and files**: send them to the bot directly, and the bridge downloads them locally for the agent.
+- **Images, files, and voice**: send them directly; Codex receives images and audio as native multimodal inputs.
+- **Persistent schedules and recovery**: `/cron` runs one-shot or recurring tasks with proactive DM delivery; `/cron history <id>` shows recent outcomes and errors. Durable ledgers reconcile unfinished work across restarts.
 - **Interactive cards**: `/help`, `/ws list`, and `/status` return cards with clickable buttons.
 
 ## Prerequisites
@@ -27,16 +31,20 @@ For a product walkthrough, see the [Feishu document](https://larkcommunity.feish
 
 ## Install
 
+Install from GitHub for now:
+
 ```bash
-npm i -g lark-channel-bridge
-# or
-pnpm add -g lark-channel-bridge
+git clone https://github.com/aredddd/comers.git
+cd comers
+pnpm install
+pnpm build
+pnpm link --global
 ```
 
 ## First run
 
 ```bash
-lark-channel-bridge run
+comers run
 ```
 
 The first run opens a QR-code wizard:
@@ -52,9 +60,9 @@ You do not need to choose a project directory up front. The bridge creates a pro
 If you already have a PersonalAgent app, pass `--app-id` during initialization to skip app creation. The command prompts for the App Secret.
 
 ```bash
-lark-channel-bridge run --app-id cli_xxx
+comers run --app-id cli_xxx
 # or initialize and start the background service directly
-lark-channel-bridge start --app-id cli_xxx
+comers start --app-id cli_xxx
 ```
 
 For Lark global apps, add `--tenant lark`.
@@ -64,9 +72,9 @@ For Lark global apps, add `--tenant lark`.
 Use `run` for first-run setup and foreground debugging. After the bot can send and receive messages, stop the foreground process with `Ctrl-C`, then use an OS-managed service for background operation:
 
 ```bash
-lark-channel-bridge start
-lark-channel-bridge status
-lark-channel-bridge stop
+comers start
+comers status
+comers stop
 ```
 
 Install globally before using service commands. The daemon's launchd plist / systemd unit / Windows task records the bridge CLI path; if that path comes from an npm temp cache through `npx`, the daemon can break when the cache is cleaned. `run` is fine through `npx` as a one-shot foreground process.
@@ -74,17 +82,19 @@ Install globally before using service commands. The daemon's launchd plist / sys
 Service commands install a per-profile service:
 
 ```bash
-lark-channel-bridge start [--profile <name>]
-lark-channel-bridge stop [--profile <name>]
-lark-channel-bridge restart [--profile <name>]
-lark-channel-bridge status [--profile <name>]
-lark-channel-bridge unregister [--profile <name>]
+comers start [--profile <name>]
+comers stop [--profile <name>]
+comers restart [--profile <name>]
+comers status [--profile <name>]
+comers unregister [--profile <name>]
 ```
 
 Platform mapping:
 - **macOS**: launchd user agent `ai.lark-channel-bridge.bot.<profile>`
 - **Linux**: systemd user unit `lark-channel-bridge.bot.<profile>.service`
 - **Windows**: Task Scheduler task `LarkChannelBridge.Bot.<profile>`, launched through a `.cmd` wrapper
+
+For compatibility with installations created before the rename, Comers keeps using the `~/.lark-channel` state directory and the service identifiers above. The old `lark-channel-bridge` CLI remains available as an alias.
 
 Daemon logs are under `~/.lark-channel/profiles/<profile>/logs/daemon/`.
 
@@ -93,15 +103,15 @@ Daemon logs are under `~/.lark-channel/profiles/<profile>/logs/daemon/`.
 By default, the bridge starts with the currently selected profile. Use `profile use <name>` to change it. Each profile keeps its own app credentials, sessions, working directories, and logs. Create multiple profiles only when you need to connect multiple PersonalAgent apps, or run Claude and Codex as separate bots:
 
 ```bash
-lark-channel-bridge start --profile claude --agent claude
-lark-channel-bridge start --profile codex --agent codex
+comers start --profile claude --agent claude
+comers start --profile codex --agent codex
 ```
 
 For example, to restart only the Codex bot:
 
 ```bash
-lark-channel-bridge restart --profile codex
-lark-channel-bridge status --profile codex
+comers restart --profile codex
+comers status --profile codex
 ```
 
 ## Commands
@@ -109,24 +119,24 @@ lark-channel-bridge status --profile codex
 ### Host CLI
 
 ```text
-lark-channel-bridge run [--profile <name>] [--agent claude|codex] [--workspace <path>] [-c <config>]
-lark-channel-bridge migrate [--profile <name>] [--agent claude|codex]
-lark-channel-bridge ps
-lark-channel-bridge kill <id|#>
-lark-channel-bridge --help
+comers run [--profile <name>] [--agent claude|codex] [--workspace <path>] [-c <config>]
+comers migrate [--profile <name>] [--agent claude|codex]
+comers ps
+comers kill <id|#>
+comers --help
 ```
 
 `profile use <name>` changes the profile used by later default starts. Use these profile management commands when running separate Claude / Codex bots, connecting multiple PersonalAgent apps, or doing scripted deployment:
 
 ```bash
-lark-channel-bridge profile create claude --agent claude
-lark-channel-bridge profile create codex --agent codex
-lark-channel-bridge profile list
-lark-channel-bridge profile use <name>
-lark-channel-bridge profile remove <name>
-lark-channel-bridge profile remove <name> --purge --yes
-lark-channel-bridge profile export <name> [--output ./profile.json] [--force]
-lark-channel-bridge profile export <name> --include-secrets --yes
+comers profile create claude --agent claude
+comers profile create codex --agent codex
+comers profile list
+comers profile use <name>
+comers profile remove <name>
+comers profile remove <name> --purge --yes
+comers profile export <name> [--output ./profile.json] [--force]
+comers profile export <name> --include-secrets --yes
 ```
 
 `profile remove` archives local state by default, including the active profile. If other profiles remain, the bridge switches to the next one; if it was the last profile, the root config is cleared so the same name can be created again. `--purge --yes` permanently deletes local state. `profile export` redacts app secrets by default; `--include-secrets --yes` includes sensitive config.
@@ -143,7 +153,15 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 | `/ws save <name>` | Save the current working directory as a named workspace |
 | `/ws use <name>` | Switch to a named workspace |
 | `/ws remove <name>` | Delete a named workspace |
-| `/resume` | Resume compatible history for the same agent, working directory, and permission mode |
+| `/resume [N]` | Codex: page through existing desktop/CLI tasks across workspaces; Claude: list history for the current workspace |
+| `/resume search <term>` | Search Codex task titles and switch to the task's original workspace when selected |
+| `/task` | Show the active Codex task and recent turns |
+| `/pin [on\|off]` | Pin or unpin the active Codex task |
+| `/archive` | Archive the active Codex task after confirmation |
+| `/handoff <thread-id>` | Continue a desktop/CLI Codex task in this DM |
+| `/steer <text>` | Add guidance to a currently running Codex turn |
+| `/answer <request-id> <text>` | Answer a free-form Codex request |
+| `/cron help` | Create and manage persistent scheduled tasks |
 | `/status` | Show profile, agent, working directory, session, lark-cli identity, and run state |
 | `/config` | Adjust presentation preferences, access settings, and lark-cli identity policy |
 | `/invite user @name` | Allow a user to use the bot in DMs |
@@ -330,13 +348,13 @@ By default the bridge reports **nothing**: no metrics, no logs leave your machin
 To wire up your own monitoring, point an environment variable at a module that default-exports (or exports `createAdapter`) an `AdapterFactory`:
 
 ```bash
-LARK_CHANNEL_TELEMETRY_MODULE=your-telemetry-package lark-channel-bridge start
+LARK_CHANNEL_TELEMETRY_MODULE=your-telemetry-package comers start
 ```
 
 That module receives every `log.*` event plus error/metric hooks and forwards them wherever you like. The interface is exported from the package root:
 
 ```ts
-import type { AdapterFactory, TelemetryAdapter, TelemetryEvent } from 'lark-channel-bridge';
+import type { AdapterFactory, TelemetryAdapter, TelemetryEvent } from 'comers';
 
 const createAdapter: AdapterFactory = (meta) => ({
   emit(event) {/* ship event */},

@@ -81,6 +81,13 @@ describe('attachment policy normalization', () => {
     ]);
   });
 
+  it('accepts audio only when the Codex App Server path opts in', () => {
+    const audio = candidate({ kind: 'audio', mime: 'audio/ogg', hash: 'voice' });
+    expect(normalizeAttachments([audio])[0]?.decision).toBe('skipped');
+    expect(normalizeAttachments([audio], { acceptAudio: true })[0]?.decision).toBe('accepted');
+    expect(safeExtensionForMime('audio/ogg')).toBe('ogg');
+  });
+
   it('uses MIME-derived safe extensions and never original names', () => {
     expect(safeExtensionForMime('image/jpeg')).toBe('jpg');
     expect(safeExtensionForMime('image/png')).toBe('png');

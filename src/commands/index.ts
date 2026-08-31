@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, isAbsolute } from 'node:path';
+import { basename, dirname, isAbsolute } from 'node:path';
 import type { LarkChannel, NormalizedMessage } from '@larksuite/channel';
 import { claudeCapability, codexCapability } from '../agent/capability';
 import { DEFAULT_MODEL, normalizeModelSelection, supportedModels } from '../agent/models';
@@ -24,7 +24,7 @@ import {
 import { GROUP_MSG_SCOPE, hasGroupMsgScope } from '../bot/app-scope';
 import { requestScopeGrantLink } from '../bot/wizard';
 import { forgetManagedCard, sendManagedCard, updateManagedCard } from '../card/managed';
-import { helpCard, resumeCard, statusCard, workspacesCard } from '../card/templates';
+import { helpCard, resumeCard, statusCard, taskCard, workspacesCard } from '../card/templates';
 import type { AppConfig, AppPreferences, MessageReplyMode, TenantBrand } from '../config/schema';
 import {
   getAgentStopGraceMs,
@@ -63,10 +63,15 @@ import {
 } from '../card/run-state';
 import { formatRelTime, listRecentSessions, type SessionSummary } from '../session/history';
 import {
+  archiveCodexThread,
   listCodexThreadHistory,
+  readCodexThreadDetail,
+  updateCodexThreadPinned,
+  type CodexThreadHistoryPage,
   type CodexThreadHistoryEntry,
   type ListCodexThreadHistoryOptions,
 } from '../session/codex-history';
+import { normalizeSessionPreview } from '../session/preview';
 import type { SessionCatalog, SessionCatalogIdentity } from '../session/catalog';
 import { isAlive, readAndPrune, resolveTarget } from '../runtime/registry';
 import { readUiSidecar } from '../ui/sidecar';
@@ -85,6 +90,12 @@ import { isMeetingNo } from '../meeting/api';
 import { answerInMeeting, meetingScopeId } from '../meeting/orchestrator';
 import type { MeetingSession } from '../meeting/session';
 import { hasStructuredLarkCliUserAuth } from '../lark-cli/identity-policy';
+import {
+  formatSchedule,
+  parseScheduleAndPrompt,
+  type SchedulerManager,
+  type ScheduledRunStatus,
+} from '../scheduler/manager';
 
 export interface Controls {
   profile: string;
@@ -112,6 +123,8 @@ export interface Controls {
   /** In-meeting agent manager; present only while the channel is connected and
    * `meeting.enabled` is on. Late-bound by startChannel. */
   meeting?: MeetingManager;
+  /** Per-profile persisted scheduler, available while the bridge is connected. */
+  scheduler?: SchedulerManager;
 }
 
 export interface CommandContext {
@@ -139,7 +152,7 @@ export interface CommandContext {
   controls: Controls;
   codexHistoryProvider?: (
     options: ListCodexThreadHistoryOptions,
-  ) => Promise<CodexThreadHistoryEntry[]>;
+  ) => Promise<CodexThreadHistoryPage>;
   claudeHistoryProvider?: (cwd: string, limit: number) => Promise<SessionSummary[]>;
   /** Set when invoked from a CardKit 2.0 form submit. Keys are input `name`s. */
   formValue?: Record<string, unknown>;
@@ -158,11 +171,32 @@ interface ResumeCandidate {
   policyFingerprint: string;
   sessionId?: string;
   threadId?: string;
+  targetCwdRealpath?: string;
+  targetPolicyFingerprint?: string;
+  targetSummary?: string;
+  expiresAt: number;
+}
+
+interface ResumePageCandidate {
+  scopeId: string;
+  agentId: 'codex';
+  cwdRealpath: string;
+  policyFingerprint: string;
+  cursor: string;
+  limit: number;
+  searchTerm?: string;
   expiresAt: number;
 }
 
 const RESUME_CANDIDATE_TTL_MS = 10 * 60 * 1000;
 const resumeCandidates = new Map<string, ResumeCandidate>();
+const resumePageCandidates = new Map<string, ResumePageCandidate>();
+const archiveCandidates = new Map<string, {
+  scopeId: string;
+  operatorId: string;
+  threadId: string;
+  expiresAt: number;
+}>();
 const AUDIT_SAFE_COMMAND_REPLY = '命令已处理。';
 const RESUME_APPLIED_REPLY = '已完成，请继续发送下一条消息。';
 
@@ -172,11 +206,18 @@ const handlers: Record<string, Handler> = {
   '/cd': handleCd,
   '/ws': handleWs,
   '/resume': handleResume,
+  '/task': handleTask,
+  '/pin': handlePin,
+  '/archive': handleArchive,
+  '/handoff': handleHandoff,
   '/status': handleStatus,
   '/help': handleHelp,
   '/account': handleAccount,
   '/config': handleConfig,
   '/stop': handleStop,
+  '/steer': handleSteer,
+  '/approval': handleApproval,
+  '/answer': handleAnswer,
   '/timeout': handleTimeout,
   '/ps': handlePs,
   '/exit': handleExit,
@@ -186,6 +227,7 @@ const handlers: Record<string, Handler> = {
   '/invite': handleInvite,
   '/remove': handleRemove,
   '/meeting': handleMeeting,
+  '/cron': handleCron,
 };
 
 /**
@@ -207,6 +249,7 @@ const ADMIN_COMMANDS = new Set([
   // Joining a meeting makes the bot visible to every participant and exposes
   // meeting content to the agent — owner/admin only.
   '/meeting',
+  '/cron',
 ]);
 
 function isAdminCommand(cmd: string): boolean {
@@ -542,53 +585,43 @@ async function handleResume(args: string, ctx: CommandContext): Promise<void> {
     return applyResume(rest, ctx);
   }
 
-  // Default: list recent sessions
-  const n = Number.parseInt(sub, 10);
-  const limit = Number.isFinite(n) && n > 0 && n <= 20 ? n : 5;
-
-  const cwd = selectedResumeCwd(ctx);
-  if (!cwd) {
-    await reply(ctx, '请先使用 /cd <path> 选择工作目录，再查看或恢复会话。');
-    return;
-  }
-
   if (ctx.chatMode !== 'p2p') {
     await reply(ctx, '群聊中不展示历史会话详情。请私聊 bot 使用 `/resume` 查看和选择历史会话。');
     return;
   }
 
   if (ctx.controls.profileConfig.agentKind === 'codex') {
+    const cwd = selectedResumeCwd(ctx);
     const identity = ctx.sessionCatalogIdentity;
-    const entry =
-      ctx.sessionCatalog && identity
-        ? ctx.sessionCatalog.activeFor(identity)
-        : undefined;
-    const history = identity ? await listCodexResumeHistory(ctx, cwd, limit) : [];
-    if (history.length > 0 && identity) {
-      const entries = history.map((thread) => {
-        const nonce = issueResumeCandidate(identity, { threadId: thread.threadId });
-        return {
-          sessionId: nonce,
-          preview: thread.name || thread.preview,
-          relTime: formatRelTime(thread.updatedAtMs),
-          detail: `Codex · ${thread.source}`,
-          current: thread.threadId === entry?.threadId,
-        };
-      });
-      const card = resumeCard(cwd, entries);
-      await ctx.channel.send(ctx.msg.chatId, { card }, commandReplyOptions(ctx));
-      return;
+    if (sub === 'more' && rest) {
+      if (!identity) {
+        await reply(ctx, '当前上下文无法继续翻页，请重新使用 `/resume`。');
+        return;
+      }
+      const page = consumeResumePageCandidate(rest, identity);
+      if (!page) {
+        await reply(ctx, '这个任务列表已过期，请重新使用 `/resume`。');
+        return;
+      }
+      return sendCodexResumePage(ctx, identity, cwd, page);
     }
-    if (entry?.threadId && identity) {
-      const nonce = issueResumeCandidate(identity, { threadId: entry.threadId });
-      await reply(
-        ctx,
-        `当前 Codex thread 可恢复。\n使用 \`/resume use ${nonce}\` 恢复（10 分钟内有效）。`,
-      );
-      return;
-    }
-    const card = resumeCard(cwd, []);
+
+    const parsed = parseCodexResumeQuery(args);
+    if (identity) return sendCodexResumePage(ctx, identity, cwd, parsed);
+    const card = resumeCard(cwd, [], {
+      globalCodex: true,
+      ...(parsed.searchTerm ? { query: parsed.searchTerm } : {}),
+    });
     await ctx.channel.send(ctx.msg.chatId, { card }, commandReplyOptions(ctx));
+    return;
+  }
+
+  // Claude history remains scoped to the selected workspace.
+  const n = Number.parseInt(sub, 10);
+  const limit = Number.isFinite(n) && n > 0 && n <= 20 ? n : 5;
+  const cwd = selectedResumeCwd(ctx);
+  if (!cwd) {
+    await reply(ctx, '请先使用 /cd <path> 选择工作目录，再查看或恢复会话。');
     return;
   }
 
@@ -616,12 +649,18 @@ async function applyResume(sessionId: string, ctx: CommandContext): Promise<void
     if (resolved) {
       ctx.activeRuns.interrupt(ctx.scope);
       if (ctx.sessionCatalogIdentity.agentId === 'codex') {
+        if (!resolved.targetCwdRealpath || !resolved.targetPolicyFingerprint) {
+          await reply(ctx, '这个任务候选缺少工作目录信息，请重新使用 `/resume` 选择。');
+          return;
+        }
+        ctx.workspaces.setCwd(ctx.scope, resolved.targetCwdRealpath);
         ctx.sessionCatalog.upsertActive({
           scopeId: ctx.sessionCatalogIdentity.scopeId,
           agentId: 'codex',
-          cwdRealpath: ctx.sessionCatalogIdentity.cwdRealpath,
-          policyFingerprint: ctx.sessionCatalogIdentity.policyFingerprint,
+          cwdRealpath: resolved.targetCwdRealpath,
+          policyFingerprint: resolved.targetPolicyFingerprint,
           threadId: resolved.threadId!,
+          ...(resolved.targetSummary ? { lastSummary: resolved.targetSummary } : {}),
         });
       } else {
         ctx.sessionCatalog.upsertActive({
@@ -633,7 +672,12 @@ async function applyResume(sessionId: string, ctx: CommandContext): Promise<void
         });
         ctx.sessions.set(ctx.scope, resolved.sessionId!, ctx.sessionCatalogIdentity.cwdRealpath);
       }
-      await reply(ctx, RESUME_APPLIED_REPLY);
+      await reply(
+        ctx,
+        resolved.targetSummary && resolved.targetCwdRealpath
+          ? `已切换到 Codex 任务「${escapeCommandMarkdown(resolved.targetSummary)}」。\n工作目录：\`${resolved.targetCwdRealpath.replace(/`/g, "'")}\`\n继续发送下一条消息即可。`
+          : RESUME_APPLIED_REPLY,
+      );
       return;
     }
     if (ctx.sessionCatalogIdentity.agentId === 'codex') {
@@ -670,7 +714,13 @@ async function applyResume(sessionId: string, ctx: CommandContext): Promise<void
 
 function issueResumeCandidate(
   identity: SessionCatalogIdentity,
-  target: { sessionId: string } | { threadId: string },
+  target: {
+    sessionId?: string;
+    threadId?: string;
+    targetCwdRealpath?: string;
+    targetPolicyFingerprint?: string;
+    targetSummary?: string;
+  },
 ): string {
   pruneResumeCandidates();
   let nonce = randomUUID().slice(0, 12);
@@ -707,9 +757,53 @@ function consumeResumeCandidate(
   return candidate;
 }
 
+function issueResumePageCandidate(
+  identity: SessionCatalogIdentity,
+  page: { cursor: string; limit: number; searchTerm?: string },
+): string {
+  pruneResumeCandidates();
+  let nonce = randomUUID().slice(0, 12);
+  while (resumeCandidates.has(nonce) || resumePageCandidates.has(nonce)) {
+    nonce = randomUUID().slice(0, 12);
+  }
+  resumePageCandidates.set(nonce, {
+    scopeId: identity.scopeId,
+    agentId: 'codex',
+    cwdRealpath: identity.cwdRealpath,
+    policyFingerprint: identity.policyFingerprint,
+    cursor: page.cursor,
+    limit: page.limit,
+    ...(page.searchTerm ? { searchTerm: page.searchTerm } : {}),
+    expiresAt: Date.now() + RESUME_CANDIDATE_TTL_MS,
+  });
+  return nonce;
+}
+
+function consumeResumePageCandidate(
+  nonce: string,
+  identity: SessionCatalogIdentity,
+): ResumePageCandidate | undefined {
+  pruneResumeCandidates();
+  const candidate = resumePageCandidates.get(nonce);
+  if (!candidate) return undefined;
+  resumePageCandidates.delete(nonce);
+  if (
+    identity.agentId !== 'codex' ||
+    candidate.scopeId !== identity.scopeId ||
+    candidate.cwdRealpath !== identity.cwdRealpath ||
+    candidate.policyFingerprint !== identity.policyFingerprint
+  ) {
+    return undefined;
+  }
+  return candidate;
+}
+
 function pruneResumeCandidates(now = Date.now()): void {
   for (const [nonce, candidate] of resumeCandidates.entries()) {
     if (candidate.expiresAt <= now) resumeCandidates.delete(nonce);
+  }
+  for (const [nonce, candidate] of resumePageCandidates.entries()) {
+    if (candidate.expiresAt <= now) resumePageCandidates.delete(nonce);
   }
 }
 
@@ -724,20 +818,23 @@ async function listClaudeResumeHistory(
 
 async function listCodexResumeHistory(
   ctx: CommandContext,
-  cwd: string,
   limit: number,
-): Promise<CodexThreadHistoryEntry[]> {
+  searchTerm?: string,
+  cursor?: string,
+): Promise<CodexThreadHistoryPage> {
   const codex = ctx.controls.profileConfig.codex;
   const binary = codex?.binaryPath;
-  if (!binary) return [];
+  if (!binary) return { entries: [] };
 
   const provider = ctx.codexHistoryProvider ?? listCodexThreadHistory;
   try {
     return await provider({
       binary,
-      cwd,
       limit,
       profileStateDir: commandProfilePaths(ctx).profileDir,
+      useStateDbOnly: false,
+      ...(searchTerm ? { searchTerm } : {}),
+      ...(cursor ? { cursor } : {}),
       ...(codex.codexHome ? { codexHome: codex.codexHome } : {}),
       ...(codex.inheritCodexHome !== undefined
         ? { inheritCodexHome: codex.inheritCodexHome }
@@ -747,8 +844,156 @@ async function listCodexResumeHistory(
     log.warn('session', 'codex-history-failed', {
       message: err instanceof Error ? err.message : String(err),
     });
-    return [];
+    return { entries: [] };
   }
+}
+
+async function sendCodexResumePage(
+  ctx: CommandContext,
+  identity: SessionCatalogIdentity,
+  cwd: string | undefined,
+  query: { limit: number; searchTerm?: string; cursor?: string },
+): Promise<void> {
+  const page = await listCodexResumeHistory(
+    ctx,
+    query.limit,
+    query.searchTerm,
+    query.cursor,
+  );
+  const current = ctx.sessionCatalog?.activeFor(identity);
+  if (page.entries.length === 0 && current?.threadId && !query.searchTerm && !query.cursor) {
+    const nonce = issueResumeCandidate(identity, {
+      threadId: current.threadId,
+      targetCwdRealpath: identity.cwdRealpath,
+      targetPolicyFingerprint: identity.policyFingerprint,
+      ...(current.lastSummary ? { targetSummary: current.lastSummary } : {}),
+    });
+    await reply(
+      ctx,
+      `当前 Codex thread 可恢复。\n使用 \`/resume use ${nonce}\` 恢复（10 分钟内有效）。`,
+    );
+    return;
+  }
+  const entries = await Promise.all(
+    page.entries.map(async (thread) => {
+      const target = await resolveCodexResumeTarget(ctx, thread.cwd);
+      const summary = normalizeSessionPreview(thread.name || thread.preview) || '(空任务)';
+      const nonce = target.ok
+        ? issueResumeCandidate(identity, {
+            threadId: thread.threadId,
+            targetCwdRealpath: target.identity.cwdRealpath,
+            targetPolicyFingerprint: target.identity.policyFingerprint,
+            targetSummary: summary,
+          })
+        : randomUUID().slice(0, 12);
+      return {
+        sessionId: nonce,
+        preview: summary,
+        relTime: formatRelTime(thread.recencyAtMs),
+        detail: formatCodexThreadDetail(thread),
+        workspace: thread.cwd,
+        current: thread.threadId === current?.threadId,
+        ...(!target.ok ? { disabledReason: target.reason } : {}),
+      };
+    }),
+  );
+  const nextPageArg = page.nextCursor
+    ? issueResumePageCandidate(identity, {
+        cursor: page.nextCursor,
+        limit: query.limit,
+        ...(query.searchTerm ? { searchTerm: query.searchTerm } : {}),
+      })
+    : undefined;
+  const card = resumeCard(cwd, entries, {
+    globalCodex: true,
+    ...(query.searchTerm ? { query: query.searchTerm } : {}),
+    ...(nextPageArg ? { nextPageArg } : {}),
+  });
+  await ctx.channel.send(ctx.msg.chatId, { card }, commandReplyOptions(ctx));
+}
+
+function parseCodexResumeQuery(args: string): { limit: number; searchTerm?: string } {
+  const trimmed = args.trim();
+  if (!trimmed) return { limit: 8 };
+  const [first = '', ...rest] = trimmed.split(/\s+/);
+  if (first === 'search') {
+    const searchTerm = rest.join(' ').trim();
+    return searchTerm ? { limit: 20, searchTerm } : { limit: 8 };
+  }
+  const n = Number.parseInt(first, 10);
+  if (/^\d+$/.test(first) && Number.isFinite(n) && n > 0 && n <= 20) {
+    return { limit: n };
+  }
+  return { limit: 20, searchTerm: trimmed };
+}
+
+async function resolveCodexResumeTarget(
+  ctx: CommandContext,
+  requestedCwd: string,
+): Promise<
+  | { ok: true; identity: SessionCatalogIdentity }
+  | { ok: false; reason: string }
+> {
+  const workspace = await resolveWorkingDirectory(requestedCwd);
+  if (!workspace.ok) return { ok: false, reason: workspace.userVisible };
+  const access = canUseDm(ctx.controls.profileConfig, ctx.controls, ctx.msg.senderId);
+  const capability = codexCapability(ctx.controls.profileConfig);
+  const policy = evaluateRunPolicy({
+    scope: {
+      source: 'im',
+      chatId: ctx.msg.chatId,
+      actorId: ctx.msg.senderId,
+    },
+    attachments: [],
+    prompt: '',
+    requestedCwd,
+    cwdRealpath: workspace.cwdRealpath,
+    access,
+    capability,
+    profileConfig: ctx.controls.profileConfig,
+    now: Date.now(),
+    codexHome: ctx.controls.profileConfig.codex?.codexHome,
+    inheritCodexHome: ctx.controls.profileConfig.codex?.inheritCodexHome,
+  });
+  if (!policy.ok) return { ok: false, reason: policy.rejectReason.userVisible };
+  return {
+    ok: true,
+    identity: {
+      scopeId: ctx.scope,
+      agentId: 'codex',
+      cwdRealpath: workspace.cwdRealpath,
+      policyFingerprint: policy.policyFingerprint,
+    },
+  };
+}
+
+function formatCodexThreadDetail(thread: CodexThreadHistoryEntry): string {
+  const source = thread.source === 'vscode'
+    ? 'Codex 桌面端'
+    : thread.source === 'cli'
+      ? 'Codex CLI'
+      : thread.source === 'exec'
+        ? '自动执行'
+        : 'Codex';
+  const status = thread.status === 'active'
+    ? '运行中'
+    : thread.status === 'idle'
+      ? '空闲'
+      : thread.status === 'systemError'
+        ? '异常'
+        : '已保存';
+  const project = basename(thread.cwd) || thread.cwd;
+  return [
+    thread.isPinned ? '📌' : undefined,
+    source,
+    project,
+    thread.gitBranch,
+    status,
+  ].filter((part): part is string => Boolean(part)).join(' · ');
+}
+
+function escapeCommandMarkdown(input: string): string {
+  return input.replace(/([*_`\\])/g, '\\$1');
 }
 
 function effectiveWorkspaceCwd(ctx: CommandContext): string | undefined {
@@ -821,6 +1066,7 @@ async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
     profileName: ctx.controls.profile,
     cwd,
     sessionId: isCodex ? catalogEntry?.threadId : sess?.sessionId,
+    sessionTitle: isCodex ? catalogEntry?.lastSummary : undefined,
     emptySessionText: isCodex ? '(未建立)' : undefined,
     sessionStale: !isCodex && Boolean(cwd && sess && sess.cwd !== cwd),
     agentName: ctx.agent.displayName,
@@ -835,6 +1081,189 @@ async function handleStatus(_args: string, ctx: CommandContext): Promise<void> {
     chatMode: ctx.chatMode,
   });
   await ctx.channel.send(ctx.msg.chatId, { card }, commandReplyOptions(ctx));
+}
+
+async function handleTask(args: string, ctx: CommandContext): Promise<void> {
+  if (ctx.controls.profileConfig.agentKind !== 'codex') {
+    await reply(ctx, '任务详情目前只对 Codex profile 可用。');
+    return;
+  }
+  if (ctx.chatMode !== 'p2p') {
+    await reply(ctx, '任务详情可能包含历史内容，请在私聊中使用 `/task`。');
+    return;
+  }
+  const sub = args.trim().toLowerCase();
+  if (sub === 'pin' || sub === 'unpin') {
+    return handlePin(sub === 'pin' ? 'on' : 'off', ctx);
+  }
+  if (sub === 'archive') return handleArchive('', ctx);
+
+  const active = activeCodexTask(ctx);
+  if (!active?.threadId) {
+    await reply(ctx, '当前还没有选中的 Codex 任务，请先用 `/resume` 选择。');
+    return;
+  }
+  try {
+    const detail = await readCodexThreadDetail({
+      ...codexTaskRequestOptions(ctx),
+      threadId: active.threadId,
+      timeoutMs: 10_000,
+    });
+    await ctx.channel.send(ctx.msg.chatId, { card: taskCard(detail) }, commandReplyOptions(ctx));
+  } catch (error) {
+    await reply(ctx, `❌ 读取任务详情失败：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function handlePin(args: string, ctx: CommandContext): Promise<void> {
+  if (ctx.controls.profileConfig.agentKind !== 'codex') {
+    await reply(ctx, '此命令只对 Codex profile 可用。');
+    return;
+  }
+  const active = activeCodexTask(ctx);
+  if (!active?.threadId) {
+    await reply(ctx, '当前没有选中的 Codex 任务。');
+    return;
+  }
+  const value = args.trim().toLowerCase();
+  const isPinned = value !== 'off' && value !== 'unpin' && value !== 'false';
+  try {
+    await updateCodexThreadPinned({
+      ...codexTaskRequestOptions(ctx),
+      threadId: active.threadId,
+      isPinned,
+      timeoutMs: 10_000,
+    });
+    await reply(ctx, isPinned ? '📌 已置顶当前 Codex 任务。' : '已取消置顶当前 Codex 任务。');
+  } catch (error) {
+    await reply(ctx, `❌ 更新置顶状态失败：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function handleArchive(args: string, ctx: CommandContext): Promise<void> {
+  if (ctx.controls.profileConfig.agentKind !== 'codex') {
+    await reply(ctx, '此命令只对 Codex profile 可用。');
+    return;
+  }
+  const active = activeCodexTask(ctx);
+  if (!active?.threadId) {
+    await reply(ctx, '当前没有选中的 Codex 任务。');
+    return;
+  }
+  if (ctx.activeRuns.get(ctx.scope)) {
+    await reply(ctx, '当前任务正在运行，请先 `/stop`，再归档。');
+    return;
+  }
+  pruneArchiveCandidates();
+  const [sub, nonce] = args.trim().split(/\s+/);
+  if (sub !== 'confirm' || !nonce) {
+    const candidate = randomUUID().slice(0, 12);
+    archiveCandidates.set(candidate, {
+      scopeId: ctx.scope,
+      operatorId: ctx.msg.senderId,
+      threadId: active.threadId,
+      expiresAt: Date.now() + 5 * 60 * 1000,
+    });
+    await reply(
+      ctx,
+      `归档会把当前任务移出普通任务列表。确认请在 5 分钟内发送：\n\`/archive confirm ${candidate}\``,
+    );
+    return;
+  }
+  const candidate = archiveCandidates.get(nonce);
+  archiveCandidates.delete(nonce);
+  if (
+    !candidate ||
+    candidate.scopeId !== ctx.scope ||
+    candidate.operatorId !== ctx.msg.senderId ||
+    candidate.threadId !== active.threadId ||
+    candidate.expiresAt <= Date.now()
+  ) {
+    await reply(ctx, '归档确认已过期或不匹配，请重新发送 `/archive`。');
+    return;
+  }
+  try {
+    await archiveCodexThread({
+      ...codexTaskRequestOptions(ctx),
+      threadId: active.threadId,
+      timeoutMs: 10_000,
+    });
+    if (ctx.sessionCatalog && ctx.sessionCatalogIdentity) {
+      ctx.sessionCatalog.archiveActive({ ...ctx.sessionCatalogIdentity, now: Date.now() });
+    }
+    ctx.sessions.clear(ctx.scope);
+    await reply(ctx, '🗄️ 当前 Codex 任务已归档。下一条普通消息会创建新任务。');
+  } catch (error) {
+    await reply(ctx, `❌ 归档失败：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function handleHandoff(args: string, ctx: CommandContext): Promise<void> {
+  if (ctx.controls.profileConfig.agentKind !== 'codex') {
+    await reply(ctx, '此命令只对 Codex profile 可用。');
+    return;
+  }
+  if (ctx.chatMode !== 'p2p') {
+    await reply(ctx, '为避免把桌面任务历史带进群聊，请在私聊中使用 `/handoff <thread-id>`。');
+    return;
+  }
+  const threadId = args.trim();
+  if (!threadId) {
+    await reply(ctx, '用法：`/handoff <Codex thread-id>`；也可以直接用 `/resume` 选择。');
+    return;
+  }
+  try {
+    const detail = await readCodexThreadDetail({
+      ...codexTaskRequestOptions(ctx),
+      threadId,
+      timeoutMs: 10_000,
+    });
+    const target = await resolveCodexResumeTarget(ctx, detail.cwd);
+    if (!target.ok) {
+      await reply(ctx, `❌ 无法接管此任务：${target.reason}`);
+      return;
+    }
+    ctx.activeRuns.interrupt(ctx.scope);
+    ctx.workspaces.setCwd(ctx.scope, target.identity.cwdRealpath);
+    ctx.sessionCatalog?.upsertActive({
+      ...target.identity,
+      threadId: detail.threadId,
+      lastSummary: normalizeSessionPreview(detail.name || detail.preview) || '(空任务)',
+    });
+    await reply(
+      ctx,
+      `📱 已接管 Codex 任务「${escapeCommandMarkdown(detail.name || detail.preview)}」。\n工作目录：\`${detail.cwd.replace(/`/g, "'")}\`\n继续发送消息即可。`,
+    );
+  } catch (error) {
+    await reply(ctx, `❌ 接管失败：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+function activeCodexTask(ctx: CommandContext): { threadId?: string } | undefined {
+  if (!ctx.sessionCatalog || !ctx.sessionCatalogIdentity) return undefined;
+  return ctx.sessionCatalog.activeFor(ctx.sessionCatalogIdentity);
+}
+
+function codexTaskRequestOptions(ctx: CommandContext): {
+  binary: string;
+  profileStateDir: string;
+  codexHome?: string;
+  inheritCodexHome?: boolean;
+} {
+  const codex = ctx.controls.profileConfig.codex;
+  if (!codex?.binaryPath) throw new Error('当前 profile 缺少 Codex binary 配置');
+  return {
+    binary: codex.binaryPath,
+    profileStateDir: commandProfilePaths(ctx).profileDir,
+    ...(codex.codexHome ? { codexHome: codex.codexHome } : {}),
+    ...(codex.inheritCodexHome !== undefined ? { inheritCodexHome: codex.inheritCodexHome } : {}),
+  };
+}
+
+function pruneArchiveCandidates(now = Date.now()): void {
+  for (const [nonce, candidate] of archiveCandidates.entries()) {
+    if (candidate.expiresAt <= now) archiveCandidates.delete(nonce);
+  }
 }
 
 function formatOwnerState(ctx: CommandContext): string {
@@ -869,6 +1298,63 @@ async function handleStop(args: string, ctx: CommandContext): Promise<void> {
   }
   // No reply for the current IM scope: if there was a run, its in-flight
   // render loop will mark the card as interrupted and re-render.
+}
+
+async function handleSteer(args: string, ctx: CommandContext): Promise<void> {
+  const text = args.trim();
+  if (!text) {
+    await reply(ctx, '用法：`/steer <追加给当前任务的内容>`');
+    return;
+  }
+  try {
+    const result = await ctx.activeRuns.steer(ctx.scope, text);
+    await reply(
+      ctx,
+      result === 'ok'
+        ? '✓ 已追加到当前 Codex turn。'
+        : result === 'not-running'
+          ? '当前会话没有正在运行的任务。'
+          : '当前 agent 不支持运行中追加消息。',
+    );
+  } catch (error) {
+    await reply(ctx, `❌ 追加失败：${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function handleApproval(args: string, ctx: CommandContext): Promise<void> {
+  const [decisionRaw, requestId, ...valueParts] = args.trim().split(/\s+/);
+  const decision =
+    decisionRaw === 'accept' ||
+    decisionRaw === 'acceptForSession' ||
+    decisionRaw === 'decline' ||
+    decisionRaw === 'cancel' ||
+    decisionRaw === 'answer'
+      ? decisionRaw
+      : undefined;
+  if (!decision || !requestId) return;
+  let value = valueParts.join(' ');
+  if (decision === 'answer') {
+    const separator = requestId.indexOf(':');
+    if (separator > 0) {
+      const encoded = requestId.slice(separator + 1);
+      value = decodeURIComponent(encoded);
+      const actualRequestId = requestId.slice(0, separator);
+      await ctx.activeRuns.respondToRequest(ctx.scope, actualRequestId, decision, value);
+      return;
+    }
+  }
+  await ctx.activeRuns.respondToRequest(ctx.scope, requestId, decision, value || undefined);
+}
+
+async function handleAnswer(args: string, ctx: CommandContext): Promise<void> {
+  const [requestId, ...answerParts] = args.trim().split(/\s+/);
+  const answer = answerParts.join(' ').trim();
+  if (!requestId || !answer) {
+    await reply(ctx, '用法：`/answer <请求ID> <回答>`');
+    return;
+  }
+  const ok = await ctx.activeRuns.respondToRequest(ctx.scope, requestId, 'answer', answer);
+  await reply(ctx, ok ? '✓ 已提交回答。' : '这个输入请求不存在或已过期。');
 }
 
 async function handleTimeout(args: string, ctx: CommandContext): Promise<void> {
@@ -1334,6 +1820,145 @@ function formatDoctorEchoStatus(echoText: string, state: RunState): string {
 async function handleHelp(_args: string, ctx: CommandContext): Promise<void> {
   const card = helpCard(ctx.agent.displayName);
   await ctx.channel.send(ctx.msg.chatId, { card }, commandReplyOptions(ctx));
+}
+
+async function handleCron(args: string, ctx: CommandContext): Promise<void> {
+  const scheduler = ctx.controls.scheduler;
+  if (!scheduler) {
+    await reply(ctx, '当前 bridge 没有可用的持久化调度器。');
+    return;
+  }
+  if (ctx.chatMode !== 'p2p') {
+    await reply(ctx, '定时 Codex 任务目前只允许在 PersonalAgent 私聊中创建。');
+    return;
+  }
+  const trimmed = args.trim();
+  const [sub = 'list', ...restParts] = trimmed.split(/\s+/);
+  const rest = restParts.join(' ');
+  if (!trimmed || sub === 'list') {
+    const jobs = scheduler.list(ctx.scope);
+    if (jobs.length === 0) {
+      await reply(ctx, '当前私聊没有定时任务。发送 `/cron help` 查看用法。');
+      return;
+    }
+    await reply(
+      ctx,
+      [
+        '**定时任务**',
+        '',
+        ...jobs.map((job) => {
+          const next = job.nextRunAt ? new Date(job.nextRunAt).toLocaleString() : '-';
+          const last = job.lastStatus ? ` · 上次 ${formatScheduledRunStatus(job.lastStatus)}` : '';
+          return `- \`${job.id}\` **${escapeCommandMarkdown(job.name)}** · ${job.status} · ${formatSchedule(job.schedule)} · 下次 ${next}${last}`;
+        }),
+        '',
+        '管理：`/cron pause|resume|run|history|remove <id>`',
+      ].join('\n'),
+    );
+    return;
+  }
+  if (sub === 'help') {
+    await reply(
+      ctx,
+      [
+        '**创建定时 Codex 任务**',
+        '- `/cron add in 10m <任务>` — 10 分钟后执行一次',
+        '- `/cron add every 2h <任务>` — 每 2 小时执行',
+        '- `/cron add daily 09:30 <任务>` — 每天 09:30 执行',
+        '- `/cron add cron 0 9 * * 1-5 <任务>` — 五段 cron（数字、`*`、列表、范围、步长）',
+        '',
+        '管理：`/cron list`、`pause`、`resume`、`run`、`history`、`remove`。',
+      ].join('\n'),
+    );
+    return;
+  }
+  if (sub === 'history') {
+    const id = rest.trim();
+    const job = scheduler.list(ctx.scope).find((candidate) => candidate.id === id);
+    if (!job) {
+      await reply(ctx, `未找到当前私聊的定时任务：\`${escapeCommandMarkdown(id || '(空)')}\``);
+      return;
+    }
+    const runs = scheduler.history(job.id, 10);
+    if (runs.length === 0) {
+      await reply(ctx, `定时任务 **${escapeCommandMarkdown(job.name)}** 还没有执行记录。`);
+      return;
+    }
+    await reply(
+      ctx,
+      [
+        `**${escapeCommandMarkdown(job.name)} · 最近执行**`,
+        '',
+        ...runs.map((run) => {
+          const when = new Date(run.startedAt ?? run.createdAt).toLocaleString();
+          const trigger = run.trigger === 'manual' ? '手动' : '定时';
+          const error = run.error ? ` · ${escapeCommandMarkdown(run.error.slice(0, 160))}` : '';
+          return `- ${when} · ${trigger} · ${formatScheduledRunStatus(run.status)}${error}`;
+        }),
+      ].join('\n'),
+    );
+    return;
+  }
+  if (sub === 'add') {
+    const parsed = parseScheduleAndPrompt(rest);
+    if (!parsed?.prompt) {
+      await reply(ctx, '时间表达式无法识别。发送 `/cron help` 查看示例。');
+      return;
+    }
+    const job = scheduler.create({
+      prompt: parsed.prompt,
+      schedule: parsed.schedule,
+      chatId: ctx.msg.chatId,
+      scopeId: ctx.scope,
+      chatType: 'p2p',
+      chatMode: 'p2p',
+      actorId: ctx.msg.senderId,
+    });
+    await reply(
+      ctx,
+      `✓ 已创建 \`${job.id}\`：**${escapeCommandMarkdown(job.name)}**\n${formatSchedule(job.schedule)}，下次 ${new Date(job.nextRunAt!).toLocaleString()}。`,
+    );
+    return;
+  }
+  if (sub === 'pause' || sub === 'resume' || sub === 'remove' || sub === 'run') {
+    const id = rest.trim();
+    const job = scheduler.list(ctx.scope).find((candidate) => candidate.id === id);
+    if (!job) {
+      await reply(ctx, `未找到当前私聊的定时任务：\`${escapeCommandMarkdown(id || '(空)')}\``);
+      return;
+    }
+    const ok = sub === 'pause'
+      ? scheduler.pause(id)
+      : sub === 'resume'
+        ? scheduler.resume(id)
+        : sub === 'remove'
+          ? scheduler.remove(id)
+          : await scheduler.runNow(id);
+    await reply(
+      ctx,
+      ok
+        ? sub === 'pause'
+          ? '⏸ 已暂停。'
+          : sub === 'resume'
+            ? '▶️ 已恢复。'
+            : sub === 'remove'
+              ? '🗑 已删除定时任务。'
+              : '▶️ 已立即触发；结果会主动回复到本私聊。'
+        : '操作失败：任务状态不允许，或任务正在执行。',
+    );
+    return;
+  }
+  await reply(ctx, '未知子命令。发送 `/cron help` 查看用法。');
+}
+
+function formatScheduledRunStatus(status: ScheduledRunStatus): string {
+  if (status === 'dispatching') return '派发中';
+  if (status === 'queued') return '已排队';
+  if (status === 'running') return '运行中';
+  if (status === 'succeeded') return '成功';
+  if (status === 'interrupted') return '已停止';
+  if (status === 'timed_out') return '超时';
+  return '失败';
 }
 
 // ─── /account ─────────────────────────────────────────────────────────────

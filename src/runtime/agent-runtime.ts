@@ -41,6 +41,7 @@ export function createRuntimeAgent(
     return new CodexAdapter({
       binary: codex.binaryPath,
       profileStateDir: appPaths.profileDir,
+      runtime: codex.runtime ?? 'app-server',
       ...(codex.codexHome ? { codexHome: codex.codexHome } : {}),
       inheritCodexHome: codex.inheritCodexHome === true,
       ignoreUserConfig: codex.ignoreUserConfig === true,

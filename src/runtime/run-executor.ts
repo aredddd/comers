@@ -1,5 +1,10 @@
 import { randomUUID } from 'node:crypto';
-import type { AgentAdapter, AgentEvent, AgentRun } from '../agent/types';
+import type {
+  AgentAdapter,
+  AgentDeliveryContext,
+  AgentEvent,
+  AgentRun,
+} from '../agent/types';
 import { ActiveRuns, type RunHandle } from '../bot/active-runs';
 import { ProcessPool } from '../bot/process-pool';
 import type { RunPolicyAllow } from '../policy/run-policy';
@@ -22,6 +27,8 @@ export interface SubmitRunInput {
   threadId?: string;
   model?: string;
   images?: readonly string[];
+  audios?: readonly string[];
+  deliveryContext?: AgentDeliveryContext;
   stopGraceMs?: number;
   nowait?: boolean;
   observability?: {
@@ -95,12 +102,15 @@ export class RunExecutor {
     const queueWaitMs = startedAt - submittedAt;
     const runOptions = {
       runId,
+      scopeId: input.scopeId,
       prompt: input.policy.prompt,
       cwd: input.policy.cwdRealpath,
       sessionId: input.sessionId,
       threadId: input.threadId,
       model: input.model,
       images: input.images,
+      audios: input.audios,
+      deliveryContext: input.deliveryContext,
       sandbox: input.policy.sandbox,
       permissionMode: input.policy.permissionMode,
       stopGraceMs: input.stopGraceMs,
