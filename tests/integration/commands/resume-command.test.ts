@@ -241,7 +241,7 @@ describe('agent-aware resume commands', () => {
 
     await expect(h.run('/status')).resolves.toBe(true);
     expect(lastContentString(h.channel)).toContain('other project task');
-    expect(lastContentString(h.channel)).toContain(targetRealpath);
+    expect(lastContentString(h.channel)).toContain(JSON.stringify(targetRealpath).slice(1, -1));
   });
 
   it('passes global scope and title search to the Codex app-server task list', async () => {
