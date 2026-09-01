@@ -331,6 +331,7 @@ rl.on('line', (line) => {
       }
     }, 25);
   } else if (req.method === 'thread/name/set') {
+    persist();
     process.stdout.write(JSON.stringify({ id: req.id, result: {} }) + '\\n');
   }
 });
