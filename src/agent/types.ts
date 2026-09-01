@@ -108,12 +108,21 @@ export interface AgentRunOptions {
   stopGraceMs?: number;
 }
 
+export interface AgentSteerInput {
+  text: string;
+  clientUserMessageId?: string;
+  images?: readonly string[];
+  audios?: readonly string[];
+}
+
+export type AgentSteerRequest = string | AgentSteerInput;
+
 export interface AgentRun {
   readonly runId: string;
   readonly events: AsyncIterable<AgentEvent>;
   stop(): Promise<void>;
   /** Add user guidance to the currently running turn when supported. */
-  steer?(text: string): Promise<void>;
+  steer?(input: AgentSteerRequest): Promise<void>;
   /** Resolve an app-server approval or structured-input request. */
   respondToRequest?(
     requestId: string,

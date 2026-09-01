@@ -10,6 +10,7 @@ import type {
   AgentEvent,
   AgentRun,
   AgentRunOptions,
+  AgentSteerRequest,
 } from '../types';
 import { log } from '../../core/logger';
 import { comersThreadName } from '../../session/preview';
@@ -196,11 +197,19 @@ export class CodexAppServerSession {
     });
   }
 
-  async steer(turnId: string, text: string): Promise<void> {
+  async steer(turnId: string, input: AgentSteerRequest): Promise<void> {
+    const normalized = typeof input === 'string' ? { text: input } : input;
     await this.client.request('turn/steer', {
       threadId: this.threadIdValue,
       expectedTurnId: turnId,
-      input: [{ type: 'text', text, text_elements: [] }],
+      ...(normalized.clientUserMessageId
+        ? { clientUserMessageId: normalized.clientUserMessageId }
+        : {}),
+      input: [
+        { type: 'text', text: normalized.text, text_elements: [] },
+        ...(normalized.images ?? []).map((path) => ({ type: 'localImage', path })),
+        ...(normalized.audios ?? []).map((path) => ({ type: 'localAudio', path })),
+      ],
     });
   }
 
@@ -307,9 +316,9 @@ class AppServerTurnRun implements AgentRun {
     }
   }
 
-  async steer(text: string): Promise<void> {
+  async steer(input: AgentSteerRequest): Promise<void> {
     if (!this.turnIdValue) throw new Error('当前 turn 尚未开始，暂时不能追加消息');
-    await this.session.steer(this.turnIdValue, text);
+    await this.session.steer(this.turnIdValue, input);
   }
 
   respondToRequest(

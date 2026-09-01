@@ -1,4 +1,4 @@
-import type { AgentRun } from '../agent/types';
+import type { AgentRun, AgentSteerRequest } from '../agent/types';
 
 export interface RunHandle {
   run: AgentRun;
@@ -8,6 +8,7 @@ export interface RunHandle {
 export class ActiveRuns {
   private readonly handles = new Map<string, RunHandle>();
   private readonly reservations = new Set<string>();
+  private readonly steerChains = new Map<string, Promise<void>>();
   private pauseDepth = 0;
   private pauseReason: string | undefined;
 
@@ -86,12 +87,34 @@ export class ActiveRuns {
     return true;
   }
 
-  async steer(chatId: string, text: string): Promise<'ok' | 'not-running' | 'unsupported'> {
-    const handle = this.handles.get(chatId);
-    if (!handle) return 'not-running';
-    if (!handle.run.steer) return 'unsupported';
-    await handle.run.steer(text);
-    return 'ok';
+  async steer(chatId: string, input: AgentSteerRequest): Promise<'ok' | 'not-running' | 'unsupported'> {
+    const target = this.handles.get(chatId);
+    if (!target) return 'not-running';
+    if (!target.run.steer) return 'unsupported';
+
+    let result: 'ok' | 'not-running' | 'unsupported' = 'ok';
+    const previous = this.steerChains.get(chatId) ?? Promise.resolve();
+    const current = previous
+      .catch(() => undefined)
+      .then(async () => {
+        const active = this.handles.get(chatId);
+        if (active !== target) {
+          result = 'not-running';
+          return;
+        }
+        if (!active.run.steer) {
+          result = 'unsupported';
+          return;
+        }
+        await active.run.steer(input);
+      });
+    this.steerChains.set(chatId, current);
+    try {
+      await current;
+      return result;
+    } finally {
+      if (this.steerChains.get(chatId) === current) this.steerChains.delete(chatId);
+    }
   }
 
   async respondToRequest(

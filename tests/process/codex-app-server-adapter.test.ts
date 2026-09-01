@@ -61,7 +61,14 @@ describe('CodexAdapter app-server runtime', () => {
     const secondEvents: AgentEvent[] = [];
     for await (const event of second.events) {
       secondEvents.push(event);
-      if (event.type === 'text') await second.steer?.('追加指示');
+      if (event.type === 'text') {
+        await second.steer?.({
+          text: '追加指示',
+          clientUserMessageId: 'om_steer',
+          images: ['/tmp/guide.png'],
+          audios: ['/tmp/guide.ogg'],
+        });
+      }
     }
     expect(secondEvents).toEqual(expect.arrayContaining([
       expect.objectContaining({ type: 'final_text', content: '第二轮完成' }),
@@ -81,7 +88,13 @@ describe('CodexAdapter app-server runtime', () => {
       }),
     ]);
     expect(records.filter((record) => record.method === 'turn/start')).toHaveLength(2);
-    expect(records.some((record) => record.method === 'turn/steer')).toBe(true);
+    const steerRecord = records.find((record) => record.method === 'turn/steer');
+    expect(steerRecord?.params.clientUserMessageId).toBe('om_steer');
+    expect(steerRecord?.params.input).toEqual(expect.arrayContaining([
+      { type: 'text', text: '追加指示', text_elements: [] },
+      { type: 'localImage', path: '/tmp/guide.png' },
+      { type: 'localAudio', path: '/tmp/guide.ogg' },
+    ]));
     expect(records.find((record) => record.method === 'turn/start')?.params.input).toContainEqual({
       type: 'localAudio',
       path: '/tmp/voice.ogg',

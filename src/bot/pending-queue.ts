@@ -15,8 +15,8 @@ export type FlushHandler = (scope: string, batch: NormalizedMessage[]) => void;
  * flushes as a single batch.
  *
  * `block(scope)` pauses the debounce timer while an agent run is active on
- * that scope — pushed messages still accumulate but no flush fires until
- * `unblock(scope)`, which arms a fresh quiet window.
+ * that scope. Runtimes without steering, or messages that lose a turn-end
+ * steering race, accumulate here until `unblock(scope)` arms a fresh window.
  *
  * Commands should bypass this queue — they're cheap and should be responsive.
  */

@@ -2,7 +2,13 @@ import type { NormalizedMessage } from '@larksuite/channel';
 import { realpath } from 'node:fs/promises';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import type { AgentEvent } from '../../../src/agent/types.js';
+import type {
+  AgentAdapter,
+  AgentEvent,
+  AgentRun,
+  AgentRunOptions,
+  AgentSteerRequest,
+} from '../../../src/agent/types.js';
 import type { FakeAgentEvents } from '../../helpers/fake-agent.js';
 import { createDefaultProfileConfig } from '../../../src/config/profile-schema.js';
 import { log } from '../../../src/core/logger.js';
@@ -82,6 +88,58 @@ afterEach(async () => {
 });
 
 describe('markdown stream startup failures', () => {
+  it('steers a natural follow-up into the active Codex turn instead of starting a queued turn', async () => {
+    const h = await createHarness();
+    const agent = new ControlledCodexAgent();
+    const bridge = await startChannel({
+      cfg: h.profileConfig,
+      agent,
+      sessions: h.sessions,
+      workspaces: h.workspaces,
+      controls: h.controls,
+    });
+    cleanups.push(() => bridge.disconnect());
+
+    await h.channel.handlers.message?.(message('om_first', 'first'));
+    await waitFor(() => agent.runs.length === 1);
+
+    await h.channel.handlers.message?.(message('om_second', 'second'));
+    await waitFor(() => agent.runs[0]?.steered.length === 1);
+
+    expect(agent.runOptions).toHaveLength(1);
+    expect(agent.runs[0]?.steered[0]).toMatchObject({
+      text: expect.stringContaining('second'),
+      clientUserMessageId: 'om_second',
+      images: [],
+      audios: [],
+    });
+    expect((agent.runs[0]?.steered[0] as { text?: string }).text).toContain('om_second');
+  });
+
+  it('queues the natural follow-up when the active Codex turn rejects steering', async () => {
+    const h = await createHarness();
+    const agent = new ControlledCodexAgent(true);
+    const bridge = await startChannel({
+      cfg: h.profileConfig,
+      agent,
+      sessions: h.sessions,
+      workspaces: h.workspaces,
+      controls: h.controls,
+    });
+    cleanups.push(() => bridge.disconnect());
+
+    await h.channel.handlers.message?.(message('om_first', 'first'));
+    await waitFor(() => agent.runs.length === 1);
+
+    await h.channel.handlers.message?.(message('om_second', 'second'));
+    expect(agent.runOptions).toHaveLength(1);
+
+    agent.runs[0]?.finish();
+    await waitFor(() => agent.runOptions.length === 2);
+    expect(agent.runOptions[1]?.prompt).toContain('second');
+    expect(agent.runOptions[1]?.prompt).toContain('om_second');
+  });
+
   it('does not leave the IM queue blocked when the agent exits before stream producer starts', async () => {
     const h = await createHarness();
     await startTestBridge(h);
@@ -640,6 +698,68 @@ function lastMarkdown(channel: FakeLarkChannel): string {
   const content = channel.sent.at(-1)?.content as { markdown?: string } | undefined;
   expect(content?.markdown).toBeTypeOf('string');
   return content?.markdown ?? '';
+}
+
+class ControlledCodexRun implements AgentRun {
+  readonly runId: string;
+  readonly steered: AgentSteerRequest[] = [];
+  readonly events: AsyncIterable<AgentEvent>;
+  private release!: () => void;
+  private stopped = false;
+
+  constructor(readonly opts: AgentRunOptions, private readonly rejectSteer = false) {
+    this.runId = opts.runId;
+    const terminal = new Promise<void>((resolve) => {
+      this.release = resolve;
+    });
+    this.events = {
+      [Symbol.asyncIterator]: async function* (this: ControlledCodexRun) {
+        await terminal;
+        if (!this.stopped) {
+          const done: AgentEvent = { type: 'done', terminationReason: 'normal' };
+          yield done;
+        }
+      }.bind(this),
+    };
+  }
+
+  async steer(input: AgentSteerRequest): Promise<void> {
+    if (this.rejectSteer) throw new Error('active turn already completed');
+    this.steered.push(input);
+  }
+
+  finish(): void {
+    this.release();
+  }
+
+  async stop(): Promise<void> {
+    this.stopped = true;
+    this.release();
+  }
+
+  async waitForExit(): Promise<boolean> {
+    return true;
+  }
+}
+
+class ControlledCodexAgent implements AgentAdapter {
+  readonly id = 'codex';
+  readonly displayName = 'Codex';
+  readonly runs: ControlledCodexRun[] = [];
+  readonly runOptions: AgentRunOptions[] = [];
+
+  constructor(private readonly rejectFirstSteer = false) {}
+
+  async isAvailable(): Promise<boolean> {
+    return true;
+  }
+
+  run(opts: AgentRunOptions): AgentRun {
+    this.runOptions.push(opts);
+    const run = new ControlledCodexRun(opts, this.rejectFirstSteer && this.runs.length === 0);
+    this.runs.push(run);
+    return run;
+  }
 }
 
 async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void> {

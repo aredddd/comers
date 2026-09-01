@@ -40,7 +40,7 @@ import {
 } from '../config/schema';
 import { resolveAppSecret } from '../config/secret-resolver';
 import { log, reportMetric, withTrace } from '../core/logger';
-import { MediaCache, type LocalAttachment } from '../media/cache';
+import { MediaCache, type LocalAttachment, type MediaResolveOptions } from '../media/cache';
 import {
   toPolicyAttachment,
   toPromptAttachment,
@@ -421,6 +421,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           workspaces,
           activeRuns,
           pending,
+          media,
           msg,
           controls,
           chatModeCache,
@@ -563,6 +564,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
           workspaces,
           activeRuns,
           pending,
+          media,
           msg,
           controls,
           chatModeCache,
@@ -773,6 +775,7 @@ interface IntakeDeps {
   workspaces: WorkspaceStore;
   activeRuns: ActiveRuns;
   pending: PendingQueue;
+  media: MediaCache;
   msg: NormalizedMessage;
   controls: Controls;
   chatModeCache: ChatModeCache;
@@ -797,6 +800,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<'queued' | 'done'> {
     workspaces,
     activeRuns,
     pending,
+    media,
     msg,
     controls,
     chatModeCache,
@@ -944,8 +948,115 @@ async function intakeMessage(deps: IntakeDeps): Promise<'queued' | 'done'> {
     return 'done';
   }
 
+  if (!scheduledJob && controls.profileConfig.agentKind === 'codex' && activeRuns.get(scope)) {
+    const steerDisposition = await steerActiveCodexMessages({
+      channel,
+      activeRuns,
+      pending,
+      media,
+      attachmentOptions: controls.profileConfig.attachments,
+      messageLedger,
+      scope,
+      queueScope,
+      mode: chatMode,
+      msg: emsg,
+    });
+    if (steerDisposition === 'steered') return 'done';
+    if (steerDisposition === 'queued') return 'queued';
+  }
+
   const size = pending.push(queueScope, emsg);
   log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
+  return 'queued';
+}
+
+type ActiveSteerDisposition = 'steered' | 'queued' | 'not-active';
+
+async function steerActiveCodexMessages(input: {
+  channel: LarkChannel;
+  activeRuns: ActiveRuns;
+  pending: PendingQueue;
+  media: MediaCache;
+  attachmentOptions: MediaResolveOptions;
+  messageLedger?: MessageLedger;
+  scope: string;
+  queueScope: string;
+  mode: ChatMode;
+  msg: NormalizedMessage;
+}): Promise<ActiveSteerDisposition> {
+  const {
+    channel,
+    activeRuns,
+    pending,
+    media,
+    attachmentOptions,
+    messageLedger,
+    scope,
+    queueScope,
+    mode,
+    msg,
+  } = input;
+  if (!activeRuns.get(scope)) return 'not-active';
+
+  // A message can land in the blocked pending queue during the small window
+  // between a batch starting and RunExecutor registering its AgentRun. If a
+  // later message sees the active run, steer the whole waiting batch together
+  // so arrival order is preserved instead of letting newer guidance overtake it.
+  const waiting = pending.cancel(queueScope);
+  const batch = [...waiting, msg];
+  try {
+    const resourceItems = batch.flatMap((message) =>
+      message.resources.map((resource) => ({ messageId: message.messageId, resource })),
+    );
+    const attachments = await media.resolve(resourceItems, {
+      ...attachmentOptions,
+      acceptAudio: true,
+    });
+    const batchIds = new Set(batch.map((message) => message.messageId));
+    const quoteTargets = [
+      ...new Set(
+        batch
+          .map((message) => replyQuoteTargetForMessage(message, mode))
+          .filter((id): id is string => Boolean(id) && !batchIds.has(id!)),
+      ),
+    ];
+    const quotes: QuotedContext[] = [];
+    for (const targetId of quoteTargets) {
+      const quote = await fetchQuotedContext(channel, targetId);
+      if (quote) quotes.push(quote);
+    }
+    const text = buildPrompt(batch, attachments, quotes, [], channel.botIdentity);
+    const accepted = attachments.filter((attachment) => attachment.decision === 'accepted');
+    const result = await activeRuns.steer(scope, {
+      text,
+      clientUserMessageId: msg.messageId,
+      images: accepted
+        .filter((attachment) => attachment.kind === 'image')
+        .map((attachment) => attachment.path),
+      audios: accepted
+        .filter((attachment) => attachment.kind === 'audio')
+        .map((attachment) => attachment.path),
+    });
+    if (result === 'ok') {
+      for (const prior of waiting) messageLedger?.markDone(prior.messageId);
+      log.info('intake', 'steered', {
+        scope,
+        batchSize: batch.length,
+        msgId: msg.messageId,
+        attachments: accepted.length,
+      });
+      return 'steered';
+    }
+    log.info('intake', 'steer-fallback', { scope, reason: result, batchSize: batch.length });
+  } catch (error) {
+    log.warn('intake', 'steer-failed-queued', {
+      scope,
+      error: error instanceof Error ? error.message : String(error),
+      batchSize: batch.length,
+    });
+  }
+
+  for (const queued of batch) pending.push(queueScope, queued);
   return 'queued';
 }
 
