@@ -78,6 +78,7 @@ export class SessionCatalog {
         if (!entry) continue;
         this.data.set(entry.key, entry);
       }
+      if (this.reconcileActiveBindings()) this.schedulePersist();
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
       log.fail('session-catalog', err, { step: 'load' });
@@ -102,6 +103,21 @@ export class SessionCatalog {
   upsertActive(input: UpsertSessionCatalogInput): SessionCatalogEntry {
     assertAgentIdentity(input);
     const key = sessionCatalogKey(input);
+    const now = input.now ?? Date.now();
+    for (const [existingKey, existing] of this.data.entries()) {
+      if (
+        existingKey !== key &&
+        existing.status === 'active' &&
+        existing.scopeId === input.scopeId &&
+        existing.agentId === input.agentId
+      ) {
+        this.data.set(existingKey, {
+          ...existing,
+          status: 'archived',
+          updatedAt: now,
+        });
+      }
+    }
     const entry: SessionCatalogEntry = {
       key,
       scopeId: input.scopeId,
@@ -109,7 +125,7 @@ export class SessionCatalog {
       cwdRealpath: input.cwdRealpath,
       policyFingerprint: input.policyFingerprint,
       status: 'active',
-      updatedAt: input.now ?? Date.now(),
+      updatedAt: now,
       ...(input.sessionId ? { sessionId: input.sessionId } : {}),
       ...(input.threadId ? { threadId: input.threadId } : {}),
       ...(input.lastSummary ? { lastSummary: input.lastSummary } : {}),
@@ -181,6 +197,28 @@ export class SessionCatalog {
       .catch((err: unknown) => {
         log.fail('session-catalog', err, { step: 'persist' });
       });
+  }
+
+  /** Older catalogs could keep one active entry per cwd/fingerprint. Preserve
+   * the history, but keep only the newest entry as the scope's current task. */
+  private reconcileActiveBindings(): boolean {
+    const activeByScope = new Map<string, SessionCatalogEntry[]>();
+    for (const entry of this.data.values()) {
+      if (entry.status !== 'active') continue;
+      const bindingKey = `${entry.scopeId}${KEY_SEPARATOR}${entry.agentId}`;
+      const entries = activeByScope.get(bindingKey) ?? [];
+      entries.push(entry);
+      activeByScope.set(bindingKey, entries);
+    }
+    let changed = false;
+    for (const entries of activeByScope.values()) {
+      entries.sort((a, b) => b.updatedAt - a.updatedAt);
+      for (const entry of entries.slice(1)) {
+        this.data.set(entry.key, { ...entry, status: 'archived' });
+        changed = true;
+      }
+    }
+    return changed;
   }
 
   private async persist(): Promise<void> {

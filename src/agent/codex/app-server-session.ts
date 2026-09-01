@@ -12,6 +12,7 @@ import type {
   AgentRunOptions,
 } from '../types';
 import { log } from '../../core/logger';
+import { comersThreadName } from '../../session/preview';
 import { buildLarkChannelEnv, type LarkChannelEnvContext } from '../lark-channel-env';
 import { CodexAppServerClient, type AppServerMessage, AsyncQueue } from './app-server-client';
 
@@ -46,6 +47,9 @@ export class CodexAppServerSession {
   private readonly client: CodexAppServerClient;
   private readonly pendingRequests = new Map<string, PendingServerRequest>();
   private threadIdValue = '';
+  private threadNameValue = '';
+  private threadPreviewValue = '';
+  private threadNameAttempted = false;
   private currentRun: AppServerTurnRun | undefined;
 
   constructor(private readonly options: CodexAppServerSessionOptions) {
@@ -98,6 +102,8 @@ export class CodexAppServerSession {
     const threadId = stringValue(thread?.id);
     if (!threadId) throw new Error('codex app-server did not return a thread id');
     this.threadIdValue = threadId;
+    this.threadNameValue = stringValue(thread?.name) ?? '';
+    this.threadPreviewValue = stringValue(thread?.preview) ?? '';
     this.client.clearMessages();
     log.info('app-server', this.requestedThreadId ? 'thread-resumed' : 'thread-started', {
       scope: this.scopeId,
@@ -107,10 +113,42 @@ export class CodexAppServerSession {
   }
 
   async prepareDelivery(opts: AgentRunOptions): Promise<void> {
+    await this.ensureReadableThreadName(opts.prompt);
     if (!opts.deliveryContext) return;
     const temp = `${this.routeFile}.tmp-${process.pid}-${Date.now()}`;
     await writeFile(temp, `${JSON.stringify(opts.deliveryContext)}\n`, { mode: 0o600 });
     await rename(temp, this.routeFile);
+  }
+
+  private async ensureReadableThreadName(prompt: string): Promise<void> {
+    if (this.threadNameAttempted) return;
+    this.threadNameAttempted = true;
+    if (this.threadNameValue.trim()) return;
+    const isFresh = !this.requestedThreadId;
+    const isLegacyComersThread = /<bridge_context>|#\s+comers\s+运行约定/i.test(
+      this.threadPreviewValue,
+    );
+    if (!isFresh && !isLegacyComersThread) return;
+    const name = comersThreadName(prompt);
+    try {
+      await this.client.request('thread/name/set', {
+        threadId: this.threadIdValue,
+        name,
+      });
+      this.threadNameValue = name;
+      log.info('app-server', 'thread-named', {
+        scope: this.scopeId,
+        threadId: this.threadIdValue,
+        nameChars: Array.from(name).length,
+      });
+    } catch (error) {
+      // Naming is cosmetic. Older Codex builds must still keep the rich
+      // app-server session instead of falling back to one-shot exec.
+      log.warn('app-server', 'thread-name-set-failed', {
+        scope: this.scopeId,
+        error: errorMessage(error),
+      });
+    }
   }
 
   run(opts: AgentRunOptions): AgentRun {

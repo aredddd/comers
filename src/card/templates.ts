@@ -281,7 +281,8 @@ export function helpCard(agentName = 'Agent'): object {
       [
         '**命令列表**',
         '',
-        '- `/new` `/reset` — 清空当前 chat 的会话',
+        '- 普通消息会一直续接当前会话，除非你主动切换',
+        '- `/new` `/reset` — 结束当前绑定并新建会话',
         '- `/new chat [name]` — 新建群+新会话，自动拉你进群',
         '- `/resume [N]` — Codex 跨项目列出本机已有任务（最多 N 条）',
         '- `/resume search <关键词>` — 按 Codex 任务标题搜索',

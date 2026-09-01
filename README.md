@@ -13,12 +13,12 @@ For a product walkthrough, see the [Feishu document](https://larkcommunity.feish
 - Forwards Feishu / Lark messages to local Claude Code or Codex CLI. Send a DM directly, or `@bot` in a group.
 - **Streaming card**: text replies and tool calls update on one Lark card in real time.
 - **COT process messages**: optionally send a process message with agent progress text and tool calls, then send the final answer separately.
-- **Session continuity**: each chat, topic, or document comment thread keeps its own session.
+- **Session continuity**: each chat or topic has one current task. Ordinary messages keep resuming it until `/resume`, `/new`, or a workspace switch changes the binding. Document comments remain isolated by comment scope.
 - **Codex mobile-client mode**: a persistent Codex App Server connection resumes real desktop/CLI tasks and exposes recent turns, pinning, archiving, approvals, steering, and native interruption.
 - **Queueing and batching**: messages sent in quick succession are handled together; messages sent during a run are queued for the next turn, while commands like `/new`, `/cd`, `/ws use`, and `/stop` can interrupt the current task.
 - **Multiple workspaces**: use `/cd` to switch the current project, and `/ws` to save and reuse common project directories.
 - **Images, files, and voice**: send them directly; Codex receives images and audio as native multimodal inputs.
-- **Persistent schedules and recovery**: `/cron` runs one-shot or recurring tasks with proactive DM delivery; `/cron history <id>` shows recent outcomes and errors. Durable ledgers reconcile unfinished work across restarts.
+- **Persistent schedules and recovery**: `/cron` runs one-shot or recurring tasks with proactive DM delivery; each job keeps a separate persistent Codex task so scheduled context cannot pollute the interactive task. `/cron history <id>` shows recent outcomes and errors. Durable ledgers reconcile unfinished work across restarts.
 - **Interactive cards**: `/help`, `/ws list`, and `/status` return cards with clickable buttons.
 
 ## Prerequisites
@@ -147,7 +147,7 @@ If a profile was created with the wrong agent kind, stop or unregister any match
 
 | Command | Effect |
 |---|---|
-| `/new`, `/reset` | Clear the current session |
+| `/new`, `/reset` | Replace the current binding with a new session; ordinary messages keep resuming it |
 | `/cd <path>` | Switch working directory and reset the session |
 | `/ws list` | List named workspaces |
 | `/ws save <name>` | Save the current working directory as a named workspace |

@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -62,6 +62,60 @@ describe('agent-aware session catalog', () => {
       }),
     ).toMatchObject({ threadId: 'thread-1', agentId: 'codex' });
     await catalog.flush();
+  });
+
+  it('keeps only one current task per scope and agent', async () => {
+    const catalog = new SessionCatalog(await path());
+    catalog.upsertActive({
+      scopeId: 'chat-1',
+      agentId: 'codex',
+      cwdRealpath: '/repo-a',
+      policyFingerprint: 'fp-a',
+      threadId: 'thread-a',
+      now: 1000,
+    });
+    catalog.upsertActive({
+      scopeId: 'chat-1',
+      agentId: 'codex',
+      cwdRealpath: '/repo-b',
+      policyFingerprint: 'fp-b',
+      threadId: 'thread-b',
+      now: 2000,
+    });
+
+    expect(catalog.activeFor({
+      scopeId: 'chat-1',
+      agentId: 'codex',
+      cwdRealpath: '/repo-a',
+      policyFingerprint: 'fp-a',
+    })).toBeUndefined();
+    expect(catalog.activeFor({
+      scopeId: 'chat-1',
+      agentId: 'codex',
+      cwdRealpath: '/repo-b',
+      policyFingerprint: 'fp-b',
+    })).toMatchObject({ threadId: 'thread-b' });
+    expect(catalog.entries().find((item) => item.threadId === 'thread-a')?.status).toBe('archived');
+    await catalog.flush();
+  });
+
+  it('reconciles legacy catalogs with multiple active tasks on load', async () => {
+    const catalogPath = await path();
+    await writeFile(
+      catalogPath,
+      `${JSON.stringify([
+        codexEntry('chat-1', 'thread-old', 1000, '/repo-a', 'fp-a'),
+        codexEntry('chat-1', 'thread-new', 2000, '/repo-b', 'fp-b'),
+      ])}\n`,
+      'utf8',
+    );
+    const catalog = new SessionCatalog(catalogPath);
+
+    await catalog.load();
+    await catalog.flush();
+
+    expect(catalog.entries().find((item) => item.threadId === 'thread-old')?.status).toBe('archived');
+    expect(catalog.entries().find((item) => item.threadId === 'thread-new')?.status).toBe('active');
   });
 
   it('rejects mismatched Claude/Codex identity fields and does not auto-resume damaged entries', async () => {
@@ -188,6 +242,28 @@ function entry(
     key: sessionCatalogKey(identity),
     ...identity,
     sessionId,
+    status: 'active' as const,
+    updatedAt,
+  };
+}
+
+function codexEntry(
+  scopeId: string,
+  threadId: string,
+  updatedAt: number,
+  cwdRealpath: string,
+  policyFingerprint: string,
+) {
+  const identity = {
+    scopeId,
+    agentId: 'codex' as const,
+    cwdRealpath,
+    policyFingerprint,
+  };
+  return {
+    key: sessionCatalogKey(identity),
+    ...identity,
+    threadId,
     status: 'active' as const,
     updatedAt,
   };

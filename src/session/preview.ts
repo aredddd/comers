@@ -5,6 +5,11 @@ export function normalizeSessionPreview(input: string, maxChars = DEFAULT_PREVIE
   return truncatePreview(text.replace(/\s+/g, ' ').trim(), maxChars);
 }
 
+export function comersThreadName(input: string, maxPreviewChars = 48): string {
+  const preview = normalizeSessionPreview(input, maxPreviewChars);
+  return preview ? `Comers · ${preview}` : 'Comers · 飞书会话';
+}
+
 function extractBridgeUserInput(input: string): string | undefined {
   const section = readPromptSection(input, 'user_input');
   if (!section) return undefined;

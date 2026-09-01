@@ -13,13 +13,13 @@
 - 在飞书私聊直接发消息，或在群里 `@bot`，把任务转给本机 Claude Code / Codex CLI。
 - **流式卡片**：文本回复和工具调用实时更新在同一张卡片上。
 - **COT 过程消息**：可选先发一条过程消息展示 agent 的阶段性文本和工具调用，再单独发送最终答案。
-- **会话延续**：每个聊天、话题或文档评论有自己的会话，不会互相串。
+- **会话延续**：每个聊天或话题只保留一个“当前任务”；普通消息会一直续接它，只有 `/resume`、`/new` 或工作目录切换才改变绑定。文档评论按评论范围独立延续。
 - **Codex 移动端模式**：默认通过常驻 Codex App Server 连接真实 Codex task，可查看已有桌面端/CLI 任务、最近 turn、置顶、归档并继续原任务。
 - **原生运行控制**：飞书卡片实时展示 Codex 工具调用和审批请求；支持批准/拒绝、回答问题、`/steer` 追加指示和 `/stop` 原生中断。
 - **排队与消息合并**：短时间连续发送的消息会合并处理；任务运行中收到的普通消息会排队到下一轮，`/new`、`/cd`、`/ws use`、`/stop` 这类命令可以中断当前任务。
 - **多工作空间**：用 `/cd` 切换当前项目，用 `/ws` 保存和复用常用项目目录。
 - **图片 / 文件 / 语音**：直接发给 bot，bridge 下载到本地；图片和语音作为原生多模态输入交给 Codex App Server。
-- **定时任务与主动通知**：`/cron` 创建一次性、间隔、每日或五段 cron 任务，执行结果主动回到原私聊；支持 `/cron history <id>` 查看最近执行与失败原因。
+- **定时任务与主动通知**：`/cron` 创建一次性、间隔、每日或五段 cron 任务，执行结果主动回到原私聊；每个定时任务有自己的持久 Codex task，不会污染交互会话；支持 `/cron history <id>` 查看最近执行与失败原因。
 - **可靠恢复**：正常 WebSocket 重投会去重；进程硬退出后，未完成消息按“至少一次”语义在下次连接时恢复（极窄的断电窗口可能重跑一次）。
 - **卡片按钮**：`/help`、`/ws list`、`/status` 返回可点击的交互卡片。
 
@@ -149,7 +149,7 @@ comers profile export <name> --include-secrets --yes
 
 | 命令 | 作用 |
 |---|---|
-| `/new`, `/reset` | 清空当前会话 |
+| `/new`, `/reset` | 结束当前绑定并新建会话；后续普通消息持续续接新会话 |
 | `/cd <path>` | 切换工作目录并重置会话 |
 | `/ws list` | 列出命名工作空间 |
 | `/ws save <name>` | 把当前工作目录保存为命名工作空间 |
@@ -204,7 +204,7 @@ lark-channel-handoff --profile codex --check
 
 ## Codex App Server 模式
 
-Codex profile 默认使用 `app-server` runtime。每个飞书 chat/topic scope 维护一个常驻连接，并直接调用 `thread/start`、`thread/resume`、`turn/start`、`turn/steer` 和 `turn/interrupt`。这让飞书侧复用的是同一条 Codex task，而不是 bridge 伪造的一份聊天记录；工具事件、用量、审批和最终回复也来自同一条协议事件流。
+Codex profile 默认使用 `app-server` runtime。每个飞书 chat/topic scope 只保留一个当前 Codex task，并直接调用 `thread/start`、`thread/resume`、`thread/name/set`、`turn/start`、`turn/steer` 和 `turn/interrupt`。不使用 `/resume` 或 `/new` 时，普通消息会一直进入这条 task；服务重启后也从持久索引恢复。Comers 创建的 task 会使用 `Comers · 用户问题` 形式的可读标题，避免 `<bridge_context>` 占据 Codex 侧任务列表。定时任务仍按 job 隔离，防止提醒内容污染日常对话。
 
 下面只是 profile 中的可选字段片段。当前 Codex 版本无法启动 App Server 时，单次运行会记录原因并自动回退到原来的 `codex exec`；也可以显式固定旧模式：
 

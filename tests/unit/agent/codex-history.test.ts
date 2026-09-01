@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import {
   CodexHistoryError,
   listCodexThreadHistory,
+  updateCodexThreadName,
 } from '../../../src/session/codex-history.js';
 import { buildAgentPrompt } from '../../../src/agent/prompt.js';
 
@@ -187,6 +188,27 @@ describe('Codex thread history provider', () => {
 
     expect(page.entries[0]?.preview).toBe('Codex 真实用户问题 第二行');
   });
+
+  it('sets a readable Codex thread name through app-server', async () => {
+    const fake = await createFakeCodex();
+    cleanup.push(fake.dir);
+
+    await updateCodexThreadName({
+      binary: fake.path,
+      profileStateDir: fake.dir,
+      threadId: 'thread-new',
+      name: 'Comers · Codex 真实用户问题',
+      timeoutMs: 5000,
+    });
+
+    const record = JSON.parse(await readFile(fake.recordPath, 'utf8')) as {
+      requests: Array<{ method: string; params?: Record<string, unknown> }>;
+    };
+    expect(record.requests).toContainEqual({
+      method: 'thread/name/set',
+      params: { threadId: 'thread-new', name: 'Comers · Codex 真实用户问题' },
+    });
+  });
 });
 
 async function createFakeCodex(
@@ -308,6 +330,8 @@ rl.on('line', (line) => {
         }) + '\\n');
       }
     }, 25);
+  } else if (req.method === 'thread/name/set') {
+    process.stdout.write(JSON.stringify({ id: req.id, result: {} }) + '\\n');
   }
 });
 `;

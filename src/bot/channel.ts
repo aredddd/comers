@@ -53,6 +53,7 @@ import type { ScopeContext } from '../policy/run-policy';
 import { createOwnerRefreshController } from '../policy/owner';
 import { RunExecutor } from '../runtime/run-executor';
 import type { SessionCatalog } from '../session/catalog';
+import { normalizeSessionPreview } from '../session/preview';
 import type { SessionStore } from '../session/store';
 import type { WorkspaceStore } from '../workspace/store';
 import { ActiveRuns, type RunHandle } from './active-runs';
@@ -1155,6 +1156,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   } else {
     log.info('session', 'fresh', { cwd });
   }
+  const lastSummary = normalizeSessionPreview(prompt);
   const recordSession = (evt: AgentEvent): void => {
     recordRunSessionEvent({
       scopeId: scope,
@@ -1163,6 +1165,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
       capability,
       policy: flow.policy,
       event: evt,
+      lastSummary,
     });
     if (evt.type === 'system' && evt.sessionId) {
       log.info('session', 'set', { sessionId: evt.sessionId });

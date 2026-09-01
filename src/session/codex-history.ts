@@ -259,6 +259,15 @@ export async function updateCodexThreadPinned(
   });
 }
 
+export async function updateCodexThreadName(
+  options: Omit<ListCodexThreadHistoryOptions, 'limit'> & { threadId: string; name: string },
+): Promise<void> {
+  await codexAppServerRequest(options, 'thread/name/set', {
+    threadId: options.threadId,
+    name: options.name,
+  });
+}
+
 export async function archiveCodexThread(
   options: Omit<ListCodexThreadHistoryOptions, 'limit'> & { threadId: string },
 ): Promise<void> {

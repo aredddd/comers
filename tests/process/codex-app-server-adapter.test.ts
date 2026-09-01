@@ -75,6 +75,11 @@ describe('CodexAdapter app-server runtime', () => {
     const records = (await readFile(fake.record, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
     expect(records.filter((record) => record.method === 'initialize')).toHaveLength(1);
     expect(records.filter((record) => record.method === 'thread/start')).toHaveLength(1);
+    expect(records.filter((record) => record.method === 'thread/name/set')).toEqual([
+      expect.objectContaining({
+        params: { threadId: 'thread-shared', name: 'Comers · first prompt' },
+      }),
+    ]);
     expect(records.filter((record) => record.method === 'turn/start')).toHaveLength(2);
     expect(records.some((record) => record.method === 'turn/steer')).toBe(true);
     expect(records.find((record) => record.method === 'turn/start')?.params.input).toContainEqual({
@@ -85,9 +90,86 @@ describe('CodexAdapter app-server runtime', () => {
     expect(JSON.parse(await readFile(routeRecord, 'utf8'))).toMatchObject({ messageId: 'om_2' });
     await adapter.close();
   });
+
+  it('preserves the name of a desktop task selected through resume', async () => {
+    const fake = await createFakeAppServer({ resumeName: 'Desktop task' });
+    cleanup.push(fake.dir);
+    const adapter = new CodexAdapter({
+      binary: fake.binary,
+      profileStateDir: fake.dir,
+      runtime: 'app-server',
+      sandbox: 'workspace-write',
+    });
+    const options = {
+      runId: 'run-resume',
+      scopeId: 'chat-1',
+      prompt: 'follow up',
+      cwd: fake.dir,
+      threadId: 'thread-shared',
+    } as const;
+
+    await adapter.prepareRun(options);
+    await adapter.close();
+
+    const records = (await readFile(fake.record, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+    expect(records.filter((record) => record.method === 'thread/resume')).toHaveLength(1);
+    expect(records.filter((record) => record.method === 'thread/name/set')).toHaveLength(0);
+  });
+
+  it('preserves an unnamed external task selected through resume', async () => {
+    const fake = await createFakeAppServer({ resumePreview: 'Desktop task preview' });
+    cleanup.push(fake.dir);
+    const adapter = new CodexAdapter({
+      binary: fake.binary,
+      profileStateDir: fake.dir,
+      runtime: 'app-server',
+      sandbox: 'workspace-write',
+    });
+
+    await adapter.prepareRun({
+      runId: 'run-external-resume',
+      scopeId: 'chat-1',
+      prompt: 'follow up',
+      cwd: fake.dir,
+      threadId: 'thread-shared',
+    });
+    await adapter.close();
+
+    const records = (await readFile(fake.record, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+    expect(records.filter((record) => record.method === 'thread/name/set')).toHaveLength(0);
+  });
+
+  it('repairs the raw title of a legacy Comers task selected through resume', async () => {
+    const fake = await createFakeAppServer({ resumePreview: '<bridge_context>{}</bridge_context>' });
+    cleanup.push(fake.dir);
+    const adapter = new CodexAdapter({
+      binary: fake.binary,
+      profileStateDir: fake.dir,
+      runtime: 'app-server',
+      sandbox: 'workspace-write',
+    });
+
+    await adapter.prepareRun({
+      runId: 'run-comers-resume',
+      scopeId: 'chat-1',
+      prompt: '继续排查会话',
+      cwd: fake.dir,
+      threadId: 'thread-shared',
+    });
+    await adapter.close();
+
+    const records = (await readFile(fake.record, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+    expect(records.filter((record) => record.method === 'thread/name/set')).toEqual([
+      expect.objectContaining({
+        params: { threadId: 'thread-shared', name: 'Comers · 继续排查会话' },
+      }),
+    ]);
+  });
 });
 
-async function createFakeAppServer(): Promise<{ dir: string; binary: string; record: string }> {
+async function createFakeAppServer(
+  options: { resumeName?: string; resumePreview?: string } = {},
+): Promise<{ dir: string; binary: string; record: string }> {
   const dir = await mkdtemp(join(tmpdir(), 'codex-app-server-test-'));
   const binary = join(dir, 'fake-codex.mjs');
   const record = join(dir, 'requests.jsonl');
@@ -95,6 +177,8 @@ async function createFakeAppServer(): Promise<{ dir: string; binary: string; rec
 import { appendFileSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 const record = ${JSON.stringify(record)};
+const resumeName = ${JSON.stringify(options.resumeName ?? null)};
+const resumePreview = ${JSON.stringify(options.resumePreview ?? '')};
 if (!process.argv.includes('app-server')) {
   process.stdout.write('codex-cli 0.146.0\\n');
   process.exit(0);
@@ -107,7 +191,9 @@ for await (const line of rl) {
   const msg = JSON.parse(line);
   appendFileSync(record, JSON.stringify({ ...msg, routeFile: process.env.LARK_CHANNEL_ROUTE_FILE }) + '\\n');
   if (msg.method === 'initialize') send({ jsonrpc: '2.0', id: msg.id, result: {} });
-  else if (msg.method === 'thread/start') send({ jsonrpc: '2.0', id: msg.id, result: { thread: { id: 'thread-shared' } } });
+  else if (msg.method === 'thread/start') send({ jsonrpc: '2.0', id: msg.id, result: { thread: { id: 'thread-shared', name: null, preview: '' } } });
+  else if (msg.method === 'thread/resume') send({ jsonrpc: '2.0', id: msg.id, result: { thread: { id: msg.params.threadId, name: resumeName, preview: resumePreview } } });
+  else if (msg.method === 'thread/name/set') send({ jsonrpc: '2.0', id: msg.id, result: {} });
   else if (msg.method === 'turn/start') {
     turn++;
     activeTurn = 'turn-' + turn;

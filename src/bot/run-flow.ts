@@ -73,6 +73,7 @@ export interface RecordRunSessionEventInput {
   capability: AgentCapability;
   policy: RunPolicyAllow;
   event: AgentEvent;
+  lastSummary?: string;
 }
 
 export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFlowResult> {
@@ -206,6 +207,7 @@ export function recordRunSessionEvent(input: RecordRunSessionEventInput): void {
       cwdRealpath,
       policyFingerprint: input.policy.policyFingerprint,
       sessionId: input.event.sessionId,
+      ...(input.lastSummary ? { lastSummary: input.lastSummary } : {}),
     });
     return;
   }
@@ -216,6 +218,7 @@ export function recordRunSessionEvent(input: RecordRunSessionEventInput): void {
       cwdRealpath: input.policy.cwdRealpath,
       policyFingerprint: input.policy.policyFingerprint,
       threadId: input.event.threadId,
+      ...(input.lastSummary ? { lastSummary: input.lastSummary } : {}),
     });
   }
 }

@@ -441,6 +441,9 @@ async function handleCd(args: string, ctx: CommandContext): Promise<void> {
     return;
   }
   ctx.activeRuns.interrupt(ctx.scope);
+  if (ctx.sessionCatalog && ctx.sessionCatalogIdentity) {
+    ctx.sessionCatalog.archiveActive({ ...ctx.sessionCatalogIdentity, now: Date.now() });
+  }
   ctx.workspaces.setCwd(ctx.scope, workspace.cwdRealpath);
   ctx.sessions.clear(ctx.scope);
   await reply(ctx, `✓ 已切换 cwd 到 \`${workspace.cwdRealpath}\`\n（session 已重置）`);
@@ -506,6 +509,9 @@ async function handleWsUse(name: string, ctx: CommandContext): Promise<void> {
     return;
   }
   ctx.activeRuns.interrupt(ctx.scope);
+  if (ctx.sessionCatalog && ctx.sessionCatalogIdentity) {
+    ctx.sessionCatalog.archiveActive({ ...ctx.sessionCatalogIdentity, now: Date.now() });
+  }
   ctx.workspaces.setCwd(ctx.scope, workspace.cwdRealpath);
   ctx.sessions.clear(ctx.scope);
   await reply(ctx, `✓ 已切换到 \`${name}\` (${workspace.cwdRealpath})\n（session 已重置）`);
