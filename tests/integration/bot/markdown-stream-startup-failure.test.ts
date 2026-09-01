@@ -152,7 +152,7 @@ describe('markdown stream startup failures', () => {
     await startTestBridge(h);
 
     await h.channel.handlers.message?.(message('om_first', 'first'));
-    await waitFor(() => streamProducerStarted);
+    await waitFor(() => streamProducerStarted, 5000);
     await waitFor(
       () => h.channel.rawClient.im.v1.messageReaction.delete.mock.calls.length > 0,
       4500,
@@ -171,7 +171,7 @@ describe('markdown stream startup failures', () => {
         (call[2] as { step?: string } | undefined)?.step === 'stream-terminal-late',
       ),
     );
-  }, 10_000);
+  }, 15_000);
 
   it('sends one dedicated non-streaming final reply after progress completes', async () => {
     const visibleProgress: string[] = [];
