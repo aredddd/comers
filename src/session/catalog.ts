@@ -35,6 +35,13 @@ export interface ArchiveSessionCatalogInput extends SessionCatalogIdentity {
   now?: number;
 }
 
+export interface ConsolidateSessionCatalogScopesInput {
+  agentId: CatalogAgentId;
+  sourceScopeIds: readonly string[];
+  targetScopeId: string;
+  now?: number;
+}
+
 export interface SessionCatalogGcOptions {
   now?: number;
   maxArchivedAgeMs?: number;
@@ -146,6 +153,43 @@ export class SessionCatalog {
     });
     this.schedulePersist();
     return true;
+  }
+
+  /** Move one valid current binding from legacy scopes to a shared scope and
+   * archive the redundant bindings. Existing shared bindings win so repeated
+   * startup migration is stable. */
+  consolidateActiveScopes(input: ConsolidateSessionCatalogScopesInput): SessionCatalogEntry | undefined {
+    const sourceScopeIds = new Set(input.sourceScopeIds.filter((scopeId) => scopeId !== input.targetScopeId));
+    if (sourceScopeIds.size === 0) return undefined;
+    const relevant = [...this.data.values()].filter(
+      (entry) => entry.status === 'active' &&
+        entry.agentId === input.agentId &&
+        (entry.scopeId === input.targetScopeId || sourceScopeIds.has(entry.scopeId)),
+    );
+    if (relevant.length === 0) return undefined;
+    const valid = relevant.filter(isValidAgentEntry);
+    const selected = valid
+      .filter((entry) => entry.scopeId === input.targetScopeId)
+      .sort((a, b) => b.updatedAt - a.updatedAt)[0] ??
+      valid
+        .filter((entry) => sourceScopeIds.has(entry.scopeId))
+        .sort((a, b) => b.updatedAt - a.updatedAt)[0];
+    const now = input.now ?? Date.now();
+    const target = selected
+      ? {
+          ...selected,
+          key: sessionCatalogKey({ ...selected, scopeId: input.targetScopeId }),
+          scopeId: input.targetScopeId,
+          status: 'active' as const,
+          updatedAt: now,
+        }
+      : undefined;
+    for (const entry of relevant) {
+      this.data.set(entry.key, { ...entry, status: 'archived', updatedAt: now });
+    }
+    if (target) this.data.set(target.key, target);
+    this.schedulePersist();
+    return target ? { ...target } : undefined;
   }
 
   entries(): SessionCatalogEntry[] {

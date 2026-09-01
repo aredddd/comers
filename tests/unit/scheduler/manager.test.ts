@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -6,6 +6,7 @@ import {
   SchedulerManager,
   formatSchedule,
   parseScheduleAndPrompt,
+  type ScheduledJob,
 } from '../../../src/scheduler/manager.js';
 
 describe('persisted scheduler', () => {
@@ -48,7 +49,7 @@ describe('persisted scheduler', () => {
       chatMode: 'p2p',
       actorId: 'ou_owner',
     });
-    expect(job.runScopeId).toBe(`oc_1:cron:${job.id}`);
+    expect(job.runScopeId).toBe('oc_1:cron');
     await first.flush();
 
     let runId = '';
@@ -100,7 +101,7 @@ describe('persisted scheduler', () => {
     expect(orJob.nextRunAt).toBe(new Date(2026, 8, 7, 9, 0).getTime());
   });
 
-  it('dispatches different due jobs concurrently instead of letting one block the ticker', async () => {
+  it('dispatches due jobs from different conversations concurrently', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'bridge-scheduler-parallel-'));
     cleanup.push(dir);
     let now = Date.now();
@@ -114,17 +115,17 @@ describe('persisted scheduler', () => {
       if (seen.size === 2) bothStarted();
       await gate;
     }, () => now);
-    const create = (prompt: string) => manager.create({
+    const create = (prompt: string, scopeId: string) => manager.create({
       prompt,
       schedule: { kind: 'once', at: now + 1000 },
-      chatId: 'oc_1',
-      scopeId: 'oc_1',
+      chatId: scopeId,
+      scopeId,
       chatType: 'p2p',
       chatMode: 'p2p',
       actorId: 'ou_owner',
     });
-    create('任务一');
-    create('任务二');
+    create('任务一', 'oc_1');
+    create('任务二', 'oc_2');
     now += 2000;
     manager.start();
     await Promise.race([
@@ -135,6 +136,96 @@ describe('persisted scheduler', () => {
     release();
     manager.stop();
     await manager.flush();
+  });
+
+  it('serializes jobs that share one scheduled-session scope', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'bridge-scheduler-serial-'));
+    cleanup.push(dir);
+    let releaseFirst!: () => void;
+    let firstStarted!: () => void;
+    const gate = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    const started = new Promise<void>((resolve) => { firstStarted = resolve; });
+    const runIds: string[] = [];
+    const manager = new SchedulerManager(join(dir, 'jobs.json'), async (_job, run) => {
+      runIds.push(run.id);
+      if (runIds.length === 1) {
+        firstStarted();
+        await gate;
+      }
+    });
+    const create = (prompt: string) => manager.create({
+      prompt,
+      schedule: { kind: 'interval', everyMs: 60_000 },
+      chatId: 'oc_1',
+      scopeId: 'oc_1',
+      chatType: 'p2p',
+      chatMode: 'p2p',
+      actorId: 'ou_owner',
+    });
+    const first = create('任务一');
+    const second = create('任务二');
+
+    const firstDispatch = manager.runNow(first.id);
+    await started;
+    expect(await manager.runNow(second.id)).toBe(false);
+    releaseFirst();
+    expect(await firstDispatch).toBe(true);
+    expect(await manager.runNow(second.id)).toBe(false);
+    expect(await manager.markRunning(runIds[0]!)).toBe(true);
+    expect(await manager.finishRun(runIds[0]!, 'succeeded')).toBe(true);
+    expect(await manager.runNow(second.id)).toBe(true);
+    expect(runIds).toHaveLength(2);
+  });
+
+  it('migrates per-job session scopes to one shared conversation scope', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'bridge-scheduler-scope-migration-'));
+    cleanup.push(dir);
+    const path = join(dir, 'jobs.json');
+    const first = new SchedulerManager(path, async () => {});
+    const one = first.create({
+      prompt: '任务一',
+      schedule: { kind: 'interval', everyMs: 60_000 },
+      chatId: 'oc_1',
+      scopeId: 'oc_1',
+      chatType: 'p2p',
+      chatMode: 'p2p',
+      actorId: 'ou_owner',
+    });
+    const two = first.create({
+      prompt: '任务二',
+      schedule: { kind: 'interval', everyMs: 60_000 },
+      chatId: 'oc_1',
+      scopeId: 'oc_1',
+      chatType: 'p2p',
+      chatMode: 'p2p',
+      actorId: 'ou_owner',
+    });
+    await first.flush();
+    const state = JSON.parse(await readFile(path, 'utf8')) as { jobs: ScheduledJob[] };
+    state.jobs = state.jobs.map((job) => ({ ...job, runScopeId: `${job.scopeId}:cron:${job.id}` }));
+    await writeFile(path, `${JSON.stringify(state, null, 2)}\n`, 'utf8');
+
+    const second = new SchedulerManager(path, async () => {});
+    await second.load();
+
+    expect(second.get(one.id)?.runScopeId).toBe('oc_1:cron');
+    expect(second.get(two.id)?.runScopeId).toBe('oc_1:cron');
+    expect(second.sessionScopeMigrations()).toEqual([{
+      targetScopeId: 'oc_1:cron',
+      sourceScopeIds: expect.arrayContaining([
+        `oc_1:cron:${one.id}`,
+        `oc_1:cron:${two.id}`,
+      ]),
+    }]);
+    const persisted = JSON.parse(await readFile(path, 'utf8')) as { jobs: ScheduledJob[] };
+    expect(persisted.jobs.every((job) => job.runScopeId === 'oc_1:cron')).toBe(true);
+
+    const third = new SchedulerManager(path, async () => {});
+    await third.load();
+    expect(third.sessionScopeMigrations()[0]?.sourceScopeIds).toEqual(expect.arrayContaining([
+      `oc_1:cron:${one.id}`,
+      `oc_1:cron:${two.id}`,
+    ]));
   });
 
   it('reconciles persisted active runs against recoverable scheduled messages', async () => {

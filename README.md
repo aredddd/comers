@@ -18,7 +18,7 @@ For a product walkthrough, see the [Feishu document](https://larkcommunity.feish
 - **Queueing and batching**: messages sent in quick succession are handled together; messages sent during a run are queued for the next turn, while commands like `/new`, `/cd`, `/ws use`, and `/stop` can interrupt the current task.
 - **Multiple workspaces**: use `/cd` to switch the current project, and `/ws` to save and reuse common project directories.
 - **Images, files, and voice**: send them directly; Codex receives images and audio as native multimodal inputs.
-- **Persistent schedules and recovery**: `/cron` runs one-shot or recurring tasks with proactive DM delivery; each job keeps a separate persistent Codex task so scheduled context cannot pollute the interactive task. `/cron history <id>` shows recent outcomes and errors. Durable ledgers reconcile unfinished work across restarts.
+- **Persistent schedules and recovery**: `/cron` runs one-shot or recurring tasks with proactive DM delivery; jobs in the same chat share one persistent, serial Codex task that stays separate from interactive chat. `/cron history <id>` shows recent outcomes and errors. Durable ledgers reconcile unfinished work across restarts.
 - **Interactive cards**: `/help`, `/ws list`, and `/status` return cards with clickable buttons.
 
 ## Prerequisites

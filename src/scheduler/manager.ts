@@ -70,10 +70,21 @@ export interface CreateScheduledJobInput {
   threadId?: string;
 }
 
+export interface ScheduledSessionScopeMigration {
+  targetScopeId: string;
+  sourceScopeIds: string[];
+}
+
+export function scheduledSessionScope(scopeId: string): string {
+  return `${scopeId}:cron`;
+}
+
 export class SchedulerManager {
   private readonly jobs = new Map<string, ScheduledJob>();
   private readonly runs = new Map<string, ScheduledRun>();
   private readonly dispatching = new Set<string>();
+  private readonly dispatchingScopes = new Set<string>();
+  private readonly sessionScopeMigrationMap = new Map<string, Set<string>>();
   private readonly ticks = new Set<Promise<void>>();
   private saving: Promise<void> = Promise.resolve();
   private timer: NodeJS.Timeout | undefined;
@@ -88,15 +99,30 @@ export class SchedulerManager {
     try {
       const raw = JSON.parse(await readFile(this.path, 'utf8')) as unknown;
       const state = normalizeState(raw);
+      let migrated = false;
       for (const candidate of state.jobs) {
         const job = normalizeJob(candidate);
-        if (job) this.jobs.set(job.id, job);
+        if (!job) continue;
+        const targetScopeId = scheduledSessionScope(job.scopeId);
+        const sourceScopeIds = this.sessionScopeMigrationMap.get(targetScopeId) ?? new Set<string>();
+        sourceScopeIds.add(`${job.scopeId}:cron:${job.id}`);
+        this.sessionScopeMigrationMap.set(targetScopeId, sourceScopeIds);
+        if (job.runScopeId !== targetScopeId) {
+          if (job.runScopeId && job.runScopeId !== job.scopeId) {
+            sourceScopeIds.add(job.runScopeId);
+          }
+          this.jobs.set(job.id, { ...job, runScopeId: targetScopeId });
+          migrated = true;
+        } else {
+          this.jobs.set(job.id, job);
+        }
       }
       for (const candidate of state.runs) {
         const run = normalizeRun(candidate);
         if (run) this.runs.set(run.id, run);
       }
       this.pruneRuns();
+      if (migrated) await this.persistNow();
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
         log.warn('scheduler', 'load-failed', { error: errorMessage(error) });
@@ -130,7 +156,7 @@ export class SchedulerManager {
       createdAt: now,
       chatId: input.chatId,
       scopeId: input.scopeId,
-      runScopeId: `${input.scopeId}:cron:${id}`,
+      runScopeId: scheduledSessionScope(input.scopeId),
       chatType: input.chatType,
       chatMode: input.chatMode,
       actorId: input.actorId,
@@ -151,6 +177,13 @@ export class SchedulerManager {
   get(id: string): ScheduledJob | undefined {
     const job = this.jobs.get(id);
     return job ? { ...job } : undefined;
+  }
+
+  sessionScopeMigrations(): ScheduledSessionScopeMigration[] {
+    return [...this.sessionScopeMigrationMap.entries()].map(([targetScopeId, sourceScopeIds]) => ({
+      targetScopeId,
+      sourceScopeIds: [...sourceScopeIds],
+    }));
   }
 
   pause(id: string): boolean {
@@ -180,7 +213,7 @@ export class SchedulerManager {
 
   async runNow(id: string): Promise<boolean> {
     const job = this.jobs.get(id);
-    if (!job || this.hasActiveRun(id) || this.dispatching.has(id)) return false;
+    if (!job || this.hasActiveRun(id) || this.dispatching.has(id) || this.scopeBusy(job)) return false;
     return this.runJob(job, false);
   }
 
@@ -285,14 +318,17 @@ export class SchedulerManager {
         job.nextRunAt !== undefined &&
         job.nextRunAt <= now &&
         !this.dispatching.has(job.id) &&
-        !this.hasActiveRun(job.id),
+        !this.hasActiveRun(job.id) &&
+        !this.scopeBusy(job),
     );
     await Promise.allSettled(due.map((job) => this.runJob(job, true)));
   }
 
   private async runJob(job: ScheduledJob, advance: boolean): Promise<boolean> {
-    if (this.dispatching.has(job.id) || this.hasActiveRun(job.id)) return false;
+    const runScopeId = job.runScopeId ?? scheduledSessionScope(job.scopeId);
+    if (this.dispatching.has(job.id) || this.hasActiveRun(job.id) || this.scopeBusy(job)) return false;
     this.dispatching.add(job.id);
+    this.dispatchingScopes.add(runScopeId);
     const createdAt = this.now();
     const run: ScheduledRun = {
       id: randomUUID().replace(/-/g, '').slice(0, 16),
@@ -330,6 +366,7 @@ export class SchedulerManager {
       return false;
     } finally {
       this.dispatching.delete(job.id);
+      this.dispatchingScopes.delete(runScopeId);
     }
   }
 
@@ -378,6 +415,17 @@ export class SchedulerManager {
     return [...this.runs.values()].some(
       (run) => run.jobId === jobId && isActiveStatus(run.status),
     );
+  }
+
+  private scopeBusy(job: ScheduledJob): boolean {
+    const runScopeId = job.runScopeId ?? scheduledSessionScope(job.scopeId);
+    if (this.dispatchingScopes.has(runScopeId)) return true;
+    return [...this.runs.values()].some((run) => {
+      if (!isActiveStatus(run.status)) return false;
+      const activeJob = this.jobs.get(run.jobId);
+      return activeJob !== undefined &&
+        (activeJob.runScopeId ?? scheduledSessionScope(activeJob.scopeId)) === runScopeId;
+    });
   }
 
   private pruneRuns(): void {

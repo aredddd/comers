@@ -99,6 +99,65 @@ describe('agent-aware session catalog', () => {
     await catalog.flush();
   });
 
+  it('consolidates legacy scheduled scopes into one current task', async () => {
+    const catalog = new SessionCatalog(await path());
+    catalog.upsertActive({
+      scopeId: 'chat-1:cron:job-a',
+      agentId: 'codex',
+      cwdRealpath: '/repo',
+      policyFingerprint: 'fp',
+      threadId: 'thread-old',
+      now: 1000,
+    });
+    catalog.upsertActive({
+      scopeId: 'chat-1:cron:job-b',
+      agentId: 'codex',
+      cwdRealpath: '/repo',
+      policyFingerprint: 'fp',
+      threadId: 'thread-new',
+      now: 2000,
+    });
+
+    const selected = catalog.consolidateActiveScopes({
+      agentId: 'codex',
+      sourceScopeIds: ['chat-1:cron:job-a', 'chat-1:cron:job-b'],
+      targetScopeId: 'chat-1:cron',
+      now: 3000,
+    });
+
+    expect(selected).toMatchObject({
+      scopeId: 'chat-1:cron',
+      threadId: 'thread-new',
+      status: 'active',
+    });
+    expect(catalog.activeFor({
+      scopeId: 'chat-1:cron',
+      agentId: 'codex',
+      cwdRealpath: '/repo',
+      policyFingerprint: 'fp',
+    })).toMatchObject({ threadId: 'thread-new' });
+    expect(catalog.entries().filter((entry) =>
+      entry.status === 'active' && entry.scopeId.startsWith('chat-1:cron'),
+    )).toHaveLength(1);
+    expect(catalog.entries().find((entry) => entry.threadId === 'thread-old')?.status).toBe('archived');
+
+    catalog.upsertActive({
+      scopeId: 'chat-1:cron:job-a',
+      agentId: 'codex',
+      cwdRealpath: '/repo',
+      policyFingerprint: 'fp',
+      threadId: 'thread-straggler',
+      now: 4000,
+    });
+    expect(catalog.consolidateActiveScopes({
+      agentId: 'codex',
+      sourceScopeIds: ['chat-1:cron:job-a'],
+      targetScopeId: 'chat-1:cron',
+      now: 5000,
+    })).toMatchObject({ threadId: 'thread-new' });
+    await catalog.flush();
+  });
+
   it('reconciles legacy catalogs with multiple active tasks on load', async () => {
     const catalogPath = await path();
     await writeFile(

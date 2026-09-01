@@ -123,13 +123,17 @@ export class CodexAppServerSession {
   private async ensureReadableThreadName(prompt: string): Promise<void> {
     if (this.threadNameAttempted) return;
     this.threadNameAttempted = true;
-    if (this.threadNameValue.trim()) return;
+    const isScheduled = this.scopeId.endsWith(':cron');
+    const isLegacyScheduledName = isScheduled && /^Comers\s*·\s*\[定时任务[：:]/.test(
+      this.threadNameValue,
+    );
+    if (this.threadNameValue.trim() && !isLegacyScheduledName) return;
     const isFresh = !this.requestedThreadId;
     const isLegacyComersThread = /<bridge_context>|#\s+comers\s+运行约定/i.test(
       this.threadPreviewValue,
     );
-    if (!isFresh && !isLegacyComersThread) return;
-    const name = comersThreadName(prompt);
+    if (!isFresh && !isLegacyComersThread && !isLegacyScheduledName) return;
+    const name = isScheduled ? 'Comers · 定时任务' : comersThreadName(prompt);
     try {
       await this.client.request('thread/name/set', {
         threadId: this.threadIdValue,

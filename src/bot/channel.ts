@@ -76,7 +76,11 @@ import {
   CotPublisher,
   finalAnswerOnlyState,
 } from './cot';
-import { SchedulerManager, type ScheduledRunStatus } from '../scheduler/manager';
+import {
+  SchedulerManager,
+  type ScheduledJob,
+  type ScheduledRunStatus,
+} from '../scheduler/manager';
 
 const DEBOUNCE_MS = 600;
 const STREAM_TERMINAL_GRACE_MS = 3000;
@@ -279,65 +283,75 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
   const channel = createLarkChannel(opts);
   const media = new MediaCache(channel, deps.appPaths?.mediaDir);
 
-  // Pending → run handoff: while a run is active on a chat, block its pending
-  // queue so messages keep accumulating without flushing. When the run ends,
-  // unblock arms a fresh quiet-window timer. Net effect: at most one run per
-  // chat in flight, and everything sent during a run merges into the next
-  // batch (only flushed once 600ms of silence has passed *after* the run).
-  const pending = new PendingQueue(DEBOUNCE_MS, (scope, batch) => {
+  // Pending → run handoff: ordinary messages debounce per conversation. Each
+  // scheduled job gets an isolated pending queue so recovered jobs never merge,
+  // while runChains serializes those queues onto their shared Codex session.
+  const runChains = new Map<string, Promise<void>>();
+  let scheduler: SchedulerManager | undefined;
+  const pending = new PendingQueue(DEBOUNCE_MS, (queueScope, batch) => {
     const firstMsg = batch[0];
     if (!firstMsg) return;
-    pending.block(scope);
-    void withTrace({ chatId: firstMsg.chatId }, async () => {
-      log.info('flush', 'start', {
-        scope,
-        batchSize: batch.length,
-        chatId: firstMsg.chatId,
-        threadId: firstMsg.threadId,
-        msgId: firstMsg.messageId,
-      });
-      try {
-        const resolvedMode = await chatModeCache.resolve(channel, firstMsg.chatId);
-        // Feishu/Lark converted topic groups may still resolve as `group` from
-        // the chat info API/cache, while message events already carry threadId.
-        // Treat threadId as authoritative for IM messages so scope and replies
-        // stay isolated per topic.
-        const mode = firstMsg.threadId ? 'topic' : resolvedMode;
-        if (firstMsg.threadId && resolvedMode !== 'topic') {
-          chatModeCache.invalidate(firstMsg.chatId);
-          logThreadModeOverride({
-            chatId: firstMsg.chatId,
-            resolvedMode,
-            threadId: firstMsg.threadId,
-          });
-        }
-        await runAgentBatch({
-          channel,
-          executor,
-          sessions,
-          sessionCatalog,
-          workspaces,
-          media,
-          batch,
-          controls,
-          cotClient,
-          callbackAuth,
-          activePolicyFingerprints,
-          lastRunModelByScope,
-          scope,
-          mode,
+    const scheduledJobId = scheduledMessageRef(firstMsg.rawContentType)?.jobId;
+    const scheduledJob = scheduledJobId ? scheduler?.get(scheduledJobId) : undefined;
+    const runScope = scheduledJob?.runScopeId ?? queueScope;
+    pending.block(queueScope);
+    const previous = runChains.get(runScope) ?? Promise.resolve();
+    const current = previous
+      .catch(() => undefined)
+      .then(() => withTrace({ chatId: firstMsg.chatId }, async () => {
+        log.info('flush', 'start', {
+          scope: runScope,
+          batchSize: batch.length,
+          chatId: firstMsg.chatId,
+          threadId: firstMsg.threadId,
+          msgId: firstMsg.messageId,
         });
-      } catch (err) {
-        log.fail('flush', err);
-      } finally {
-        for (const message of batch) messageLedger?.markDone(message.messageId);
-        pending.unblock(scope);
-        log.info('flush', 'end');
-      }
-    });
+        try {
+          const resolvedMode = await chatModeCache.resolve(channel, firstMsg.chatId);
+          // Feishu/Lark converted topic groups may still resolve as `group` from
+          // the chat info API/cache, while message events already carry threadId.
+          // Treat threadId as authoritative for IM messages so scope and replies
+          // stay isolated per topic.
+          const mode = firstMsg.threadId ? 'topic' : resolvedMode;
+          if (firstMsg.threadId && resolvedMode !== 'topic') {
+            chatModeCache.invalidate(firstMsg.chatId);
+            logThreadModeOverride({
+              chatId: firstMsg.chatId,
+              resolvedMode,
+              threadId: firstMsg.threadId,
+            });
+          }
+          await runAgentBatch({
+            channel,
+            executor,
+            sessions,
+            sessionCatalog,
+            workspaces,
+            media,
+            batch,
+            controls,
+            cotClient,
+            callbackAuth,
+            activePolicyFingerprints,
+            lastRunModelByScope,
+            scope: runScope,
+            mode,
+          });
+        } catch (err) {
+          log.fail('flush', err);
+        } finally {
+          for (const message of batch) messageLedger?.markDone(message.messageId);
+          pending.unblock(queueScope);
+          log.info('flush', 'end');
+        }
+      }));
+    runChains.set(runScope, current);
+    void current.finally(() => {
+      if (runChains.get(runScope) === current) runChains.delete(runScope);
+    }).catch((error) => log.fail('run-chain', error, { scope: runScope }));
   });
 
-  const scheduler = deps.appPaths?.mediaDir
+  scheduler = deps.appPaths?.mediaDir
     ? new SchedulerManager(
         join(dirname(deps.appPaths.mediaDir), 'scheduled-jobs.json'),
         async (job, scheduledRun) => {
@@ -363,7 +377,7 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
             log.info('scheduler', 'duplicate-anchor', { id: job.id, msgId: synthetic.messageId });
             return;
           }
-          pending.push(job.runScopeId ?? job.scopeId, synthetic);
+          pending.push(scheduledQueueScope(job), synthetic);
           messageLedger?.markQueued(synthetic.messageId);
           // Do not let SchedulerManager advance a one-shot/recurring job until
           // its queued work is durably recoverable.
@@ -373,6 +387,13 @@ export async function startChannel(deps: StartChannelDeps): Promise<BridgeChanne
     : undefined;
   await scheduler?.load();
   if (scheduler) {
+    for (const migration of scheduler.sessionScopeMigrations()) {
+      sessionCatalog?.consolidateActiveScopes({
+        ...migration,
+        agentId: controls.profileConfig.agentKind,
+      });
+    }
+    await sessionCatalog?.flush();
     const recoverableRunIds = new Set(
       (messageLedger?.recoverable() ?? [])
         .map((message) => scheduledMessageRef(message.rawContentType)?.runId)
@@ -705,6 +726,10 @@ function scheduledMessageRef(rawContentType: string): {
   return { jobId, ...(runId ? { runId } : {}) };
 }
 
+function scheduledQueueScope(job: Pick<ScheduledJob, 'id' | 'runScopeId' | 'scopeId'>): string {
+  return `${job.runScopeId ?? job.scopeId}:job:${job.id}`;
+}
+
 type ScheduledTerminalStatus = Extract<
   ScheduledRunStatus,
   'succeeded' | 'failed' | 'interrupted' | 'timed_out'
@@ -824,6 +849,7 @@ async function intakeMessage(deps: IntakeDeps): Promise<'queued' | 'done'> {
   const scheduledJobId = scheduledMessageRef(msg.rawContentType)?.jobId;
   const scheduledJob = scheduledJobId ? controls.scheduler?.get(scheduledJobId) : undefined;
   const scope = scheduledJob?.runScopeId ?? conversationScope;
+  const queueScope = scheduledJob ? scheduledQueueScope(scheduledJob) : scope;
   log.info('intake', 'enter', {
     scope,
     chatType: msg.chatType,
@@ -912,13 +938,13 @@ async function intakeMessage(deps: IntakeDeps): Promise<'queued' | 'done'> {
     controls,
   });
   if (handled) {
-    const dropped = pending.cancel(scope);
+    const dropped = pending.cancel(queueScope);
     for (const pendingMessage of dropped) messageLedger?.markDone(pendingMessage.messageId);
     log.info('intake', 'command', { scope, droppedPending: dropped.length });
     return 'done';
   }
 
-  const size = pending.push(scope, emsg);
+  const size = pending.push(queueScope, emsg);
   log.info('intake', 'queued', { scope, queueSize: size, debounceMs: DEBOUNCE_MS });
   return 'queued';
 }

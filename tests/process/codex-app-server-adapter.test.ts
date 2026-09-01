@@ -165,6 +165,36 @@ describe('CodexAdapter app-server runtime', () => {
       }),
     ]);
   });
+
+  it('uses one generic title for the shared scheduled task', async () => {
+    const fake = await createFakeAppServer({
+      resumeName: 'Comers · [定时任务：旧任务] 检查状态',
+      resumePreview: '<bridge_context>{}</bridge_context>',
+    });
+    cleanup.push(fake.dir);
+    const adapter = new CodexAdapter({
+      binary: fake.binary,
+      profileStateDir: fake.dir,
+      runtime: 'app-server',
+      sandbox: 'workspace-write',
+    });
+
+    await adapter.prepareRun({
+      runId: 'run-scheduled-resume',
+      scopeId: 'chat-1:cron',
+      prompt: '[定时任务：新任务]\n继续检查',
+      cwd: fake.dir,
+      threadId: 'thread-shared',
+    });
+    await adapter.close();
+
+    const records = (await readFile(fake.record, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+    expect(records.filter((record) => record.method === 'thread/name/set')).toEqual([
+      expect.objectContaining({
+        params: { threadId: 'thread-shared', name: 'Comers · 定时任务' },
+      }),
+    ]);
+  });
 });
 
 async function createFakeAppServer(
