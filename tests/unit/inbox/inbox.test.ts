@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { InboxStore } from '../../../src/inbox/store';
@@ -9,12 +9,13 @@ import { InboxEngine } from '../../../src/inbox/engine';
 import { InboxCliError, type JsonCli } from '../../../src/inbox/cli-client';
 import { DEFAULT_INBOX_CONFIG, type InboxEvent, type InboxItem, type InboxConfig } from '../../../src/inbox/types';
 import type { InboxAgent } from '../../../src/inbox/agent';
+import * as history from '../../../src/session/codex-history';
 import { CodexInboxAgent } from '../../../src/inbox/agent';
 import { FakeAgentAdapter } from '../../helpers/fake-agent';
 import { startInboxServer } from '../../../src/inbox/server';
 
 const dirs: string[] = [];
-afterEach(async () => { for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true }); });
+afterEach(async () => { vi.restoreAllMocks(); for (const dir of dirs.splice(0)) await rm(dir, { recursive: true, force: true }); });
 async function fixture() { const dir = await mkdtemp(join(tmpdir(), 'comers-inbox-')); dirs.push(dir); return { dir, store: new InboxStore(join(dir, 'state.json')) }; }
 function event(version = 'v1', source: InboxEvent['source'] = 'p2p'): InboxEvent {
   return { id: 'event-1', key: 'message:c:m', version, source, text: '请分析这个问题', title: '待处理', observedAt: 1000, messageId: 'om_test', chatId: 'oc_test' };
@@ -148,15 +149,56 @@ describe('AI work flow', () => {
     const target = store.snapshot().items.find((row) => row.id === items[1]!.id)!;
     expect(target.events).toHaveLength(2); expect(target.events.find((row) => row.id === 'event-1')!.version).toBe('v2');
   });
-  it('准备执行始终新建会话，不传 source session 作为 threadId', async () => {
-    const { dir } = await fixture();
-    const fake = new FakeAgentAdapter({ events: [{ type: 'system', threadId: 'new-thread' }, { type: 'final_text', content: JSON.stringify({ artifacts: [{ kind: 'reply', title: '回复', body: '建议回复', targetEventId: 'event-1' }] }) }, { type: 'done', terminationReason: 'normal', threadId: 'new-thread' }] });
-    const worker = new CodexInboxAgent({ ...DEFAULT_INBOX_CONFIG, codexModel: 'verified-account-model' }, dir, fake);
-    const item: InboxItem = { id: 'item', key: 'key', revision: 1, status: 'running', title: '问题', events: [event()], artifacts: [], updatedAt: 1, sourceSessionId: 'original-thread' };
-    const result = await worker.prepare(item, undefined, dir, { action: 'reply', title: '问题', reason: '答复' }, async () => {});
-    expect(fake.runOptions[0]!.threadId).toBeUndefined(); expect(fake.runOptions[0]!.sessionId).toBeUndefined();
-    expect(fake.runOptions[0]!.model).toBe('verified-account-model');
-    expect(result.sessionId).toBe('new-thread'); expect(result.artifacts[0]!.status).toBe('pending');
+  it('分类、文字与代码处理及重启复用一个会话，项目目录稳定且每轮重新读取关联上下文', async () => {
+    const { dir } = await fixture(); const project = join(dir, 'project');
+    const classifier = [{ type: 'system', threadId: 'shared-thread' }, { type: 'final_text', content: JSON.stringify({ action: 'reply', title: '回复', reason: '需要回复' }) }, { type: 'done', terminationReason: 'normal', threadId: 'shared-thread' }] as const;
+    const preparation = [{ type: 'system', threadId: 'shared-thread' }, { type: 'final_text', content: JSON.stringify({ artifacts: [{ kind: 'reply', title: '回复', body: '建议回复', targetEventId: 'event-1' }] }) }, { type: 'done', terminationReason: 'normal', threadId: 'shared-thread' }] as const;
+    const fake = new FakeAgentAdapter({ events: [classifier, preparation, preparation] });
+    const config = { ...DEFAULT_INBOX_CONFIG, codexModel: 'verified-account-model', sessionProjectDir: project, sessionPoolSize: 1, maxConcurrentRuns: 1 };
+    const worker = new CodexInboxAgent(config, dir, fake);
+    const item: InboxItem = { id: 'item', key: 'key', revision: 1, status: 'running', title: '问题', events: [event()], artifacts: [], updatedAt: 1 };
+    const reader = vi.spyOn(history, 'readCodexThreadDetail').mockResolvedValue({ threadId: 'original-thread', turns: [{ userText: '上下文版本一', assistantText: '只读资料', status: 'completed' }] } as history.CodexThreadDetail);
+    await worker.classify(item, [], []);
+    const route = { id: 'route', name: '仓库', cwd: '/original', sourceSessionId: 'original-thread' };
+    const result = await worker.prepare(item, route, '/isolated-worktree', { action: 'reply', title: '问题', reason: '答复' }, async () => {});
+    reader.mockResolvedValue({ threadId: 'original-thread', turns: [{ userText: '上下文版本二', status: 'completed' }] } as history.CodexThreadDetail);
+    const restarted = new CodexInboxAgent(config, dir, fake);
+    await restarted.prepare({ ...item, id: 'another' }, route, '/another-worktree', { action: 'code', title: '修复', reason: '需修改' }, async () => {});
+    expect(fake.runOptions[0]!.threadId).toBeUndefined();
+    expect(fake.runOptions.slice(1).map((run) => run.threadId)).toEqual(['shared-thread', 'shared-thread']);
+    expect(new Set(fake.runOptions.map((run) => run.cwd))).toEqual(new Set([project]));
+    expect(new Set(fake.runOptions.map((run) => run.scopeId))).toEqual(new Set(['inbox:pool:0']));
+    expect(fake.runOptions[1]!.writableRoots).toEqual([]);
+    expect(fake.runOptions[2]!.writableRoots).toEqual(['/another-worktree']);
+    expect(fake.runOptions[1]!.prompt).toContain('上下文版本一'); expect(fake.runOptions[2]!.prompt).toContain('上下文版本二');
+    expect(reader).toHaveBeenCalledTimes(2); expect(fake.runOptions[0]!.model).toBe('verified-account-model');
+    expect(result.sessionId).toBe('shared-thread'); expect(result.artifacts[0]!.status).toBe('pending');
+    expect(JSON.parse(await readFile(join(dir, 'session-pool.json'), 'utf8'))).toEqual({ sessions: ['shared-thread'], projectDir: project });
+  });
+  it('固定会话恢复异常、ID 意外变化或目录变化时拒绝创建替代会话', async () => {
+    const { dir } = await fixture(); const path = join(dir, 'processing-session.json');
+    const fake = new FakeAgentAdapter({ events: [{ type: 'system', threadId: 'unexpected-thread' }] });
+    await writeFile(path, JSON.stringify({ sessionId: 'shared-thread', projectDir: join(dir, 'workspace') }));
+    const worker = new CodexInboxAgent(DEFAULT_INBOX_CONFIG, dir, fake);
+    const item: InboxItem = { id: 'i', key: 'k', revision: 1, status: 'running', title: '问题', events: [event()], artifacts: [], updatedAt: 1 };
+    await expect(worker.classify(item, [], [])).rejects.toThrow('池中会话 ID 意外变化');
+    expect(fake.runOptions[0]!.threadId).toBe('shared-thread');
+    await expect(new CodexInboxAgent({ ...DEFAULT_INBOX_CONFIG, sessionProjectDir: '/changed' }, dir, fake).routes()).rejects.toThrow('项目目录变化');
+    await writeFile(join(dir, 'session-pool.json'), '{bad json');
+    await expect(new CodexInboxAgent(DEFAULT_INBOX_CONFIG, dir, fake).classify(item, [], [])).rejects.toThrow();
+    expect(fake.runOptions).toHaveLength(1);
+  });
+  it('读取源上下文期间停止处理器后，不再分配或启动新 turn', async () => {
+    const { dir } = await fixture(); const fake = new FakeAgentAdapter();
+    const worker = new CodexInboxAgent(DEFAULT_INBOX_CONFIG, dir, fake);
+    let finish!: (value: history.CodexThreadDetail) => void;
+    const read = vi.spyOn(history, 'readCodexThreadDetail').mockImplementation(() => new Promise((resolve) => { finish = resolve; }));
+    const item: InboxItem = { id: 'i', key: 'k', revision: 1, status: 'running', title: '问题', events: [event()], artifacts: [], updatedAt: 1 };
+    const task = worker.prepare(item, { id: 'r', name: '源会话', cwd: dir, sourceSessionId: 'source' }, dir, { action: 'reply', title: '问题', reason: '回复' }, async () => {});
+    const rejected = expect(task).rejects.toThrow('已停止');
+    await vi.waitFor(() => expect(read).toHaveBeenCalledOnce());
+    await worker.close(); finish({ threadId: 'source', turns: [] } as unknown as history.CodexThreadDetail);
+    await rejected; expect(fake.runOptions).toHaveLength(0);
   });
   it('本机审阅 API 拒绝无 token 访问，不渲染来源 HTML', async () => {
     const { store, dir } = await fixture(); await reviewable(store); const console = await startInboxServer(store, dir);

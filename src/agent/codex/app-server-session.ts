@@ -135,7 +135,8 @@ export class CodexAppServerSession {
       this.threadPreviewValue,
     );
     if (!isFresh && !isLegacyComersThread && !isLegacyScheduledName) return;
-    const name = isScheduled ? 'Comers · 定时任务' : comersThreadName(prompt);
+    const name = this.scopeId.startsWith('inbox:pool:') ? `Comers 工作收件箱 · ${Number(this.scopeId.split(':').at(-1)) + 1}`
+      : isScheduled ? 'Comers · 定时任务' : comersThreadName(prompt);
     try {
       await this.client.request('thread/name/set', {
         threadId: this.threadIdValue,
@@ -183,6 +184,9 @@ export class CodexAppServerSession {
       clientUserMessageId: opts.deliveryContext?.messageId ?? opts.runId,
       input,
       cwd: this.cwd,
+      ...(opts.writableRoots ? { sandboxPolicy: opts.sandbox === 'workspace-write'
+        ? { type: 'workspaceWrite', writableRoots: [...opts.writableRoots], networkAccess: false }
+        : { type: 'readOnly' } } : {}),
       ...(opts.model ? { model: opts.model } : {}),
     });
   }

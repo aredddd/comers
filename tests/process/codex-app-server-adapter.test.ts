@@ -104,6 +104,33 @@ describe('CodexAdapter app-server runtime', () => {
     await adapter.close();
   });
 
+  it('fixed inbox transport sends worktree write roots without changing project cwd', async () => {
+    const fake = await createFakeAppServer(); cleanup.push(fake.dir);
+    const adapter = new CodexAdapter({ binary: fake.binary, profileStateDir: fake.dir, runtime: 'app-server', requireAppServer: true });
+    const options = { runId: 'code-run', scopeId: 'inbox:processing', prompt: 'code', cwd: fake.dir, sandbox: 'workspace-write', writableRoots: ['/isolated-worktree'] } as const;
+    await adapter.prepareRun(options);
+    const run = adapter.run(options);
+    for await (const event of run.events) if (event.type === 'approval_request') await run.respondToRequest?.(event.request.id, 'accept');
+    await adapter.close();
+    const records = (await readFile(fake.record, 'utf8')).trim().split('\n').map((line) => JSON.parse(line));
+    expect(records.find((record) => record.method === 'turn/start')?.params).toMatchObject({ cwd: fake.dir, sandboxPolicy: { type: 'workspaceWrite', writableRoots: ['/isolated-worktree'], networkAccess: false } });
+  });
+  it('fixed inbox refuses resume failure rather than falling back to exec', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'codex-resume-failure-')); cleanup.push(dir);
+    const binary = join(dir, 'fake-codex.mjs');
+    await writeFile(binary, `#!/usr/bin/env node
+import { createInterface } from 'node:readline';
+if (!process.argv.includes('app-server')) { process.stdout.write('codex-cli 0.146.0\\n'); process.exit(0); }
+for await (const line of createInterface({ input: process.stdin })) {
+  const msg = JSON.parse(line);
+  if (msg.method === 'initialize') process.stdout.write(JSON.stringify({id:msg.id,result:{}})+'\\n');
+  if (msg.method === 'thread/resume') process.stdout.write(JSON.stringify({id:msg.id,error:{code:-32000,message:'already has an active writer'}})+'\\n');
+}`); await chmod(binary, 0o755);
+    const adapter = new CodexAdapter({ binary, profileStateDir: dir, runtime: 'app-server', requireAppServer: true });
+    await expect(adapter.prepareRun({ runId: 'r', scopeId: 'inbox:processing', cwd: dir, threadId: 'shared', prompt: 'retry' })).rejects.toThrow('active writer');
+    await adapter.close();
+  });
+
   it('preserves the name of a desktop task selected through resume', async () => {
     const fake = await createFakeAppServer({ resumeName: 'Desktop task' });
     cleanup.push(fake.dir);

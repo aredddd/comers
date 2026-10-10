@@ -420,4 +420,4 @@ export default createAdapter;
 <img src="./assets/feedback-group-qr.png" alt="飞书反馈群二维码" width="360">
 # AI 工作收件箱
 
-新增独立的 comers inbox 命令：每 10 秒检查私聊、群聊 @ 和 Meegle 缺陷变化，引用关联会话上下文并新建处理会话，产出代码与回复草稿供分别审阅。详见[使用说明](docs/INBOX.zh.md)。
+新增独立的 comers inbox 命令：每 10 秒检查私聊、群聊 @ 和 Meegle 缺陷变化，每轮重新读取关联会话上下文，并复用固定容量的处理会话池，产出代码与回复草稿供分别审阅。详见[使用说明](docs/INBOX.zh.md)。

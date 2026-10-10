@@ -1,6 +1,6 @@
 import type { Command } from 'commander';
 import { mkdir, readFile, rm, realpath } from 'node:fs/promises';
-import { resolve, join } from 'node:path';
+import { resolve, join, isAbsolute } from 'node:path';
 import { writeFileAtomic } from '../../platform/atomic-write';
 import { acquireHostLock } from '../../runtime/host-lock';
 import { CodexInboxAgent } from '../../inbox/agent';
@@ -75,15 +75,17 @@ export async function loadInboxConfig(path: string): Promise<InboxConfig> {
   if (!Number.isInteger(config.intervalMs) || config.intervalMs < 1000 || !Number.isFinite(config.overlapMs) || config.overlapMs < 0 ||
       !Number.isFinite(config.messageLookbackMs) || config.messageLookbackMs < 0 ||
       !Number.isInteger(config.agentTimeoutMs) || config.agentTimeoutMs < 1000 ||
-      config.maxConcurrentRuns !== 1 || !Array.isArray(config.sources) || !config.sources.length ||
+      !Number.isInteger(config.sessionPoolSize) || config.sessionPoolSize < 1 || config.sessionPoolSize > 5 ||
+      !Number.isInteger(config.maxConcurrentRuns) || config.maxConcurrentRuns < 1 || config.maxConcurrentRuns > config.sessionPoolSize || !Array.isArray(config.sources) || !config.sources.length ||
       new Set(config.sources).size !== config.sources.length || config.sources.some((source) => !['p2p', 'mention', 'defect'].includes(source)) ||
       !Array.isArray(config.defectTypeKeys) || config.defectTypeKeys.some((key) => typeof key !== 'string') ||
       !Array.isArray(config.routes) || config.routes.some((route) => !route.id || !route.cwd || !route.name) ||
       new Set(config.routes.map((route) => route.id)).size !== config.routes.length ||
       typeof config.codexBinary !== 'string' || typeof config.discoverSessions !== 'boolean' ||
+      (config.sessionProjectDir !== undefined && (typeof config.sessionProjectDir !== 'string' || !isAbsolute(config.sessionProjectDir))) ||
       (config.codexModel !== undefined && (typeof config.codexModel !== 'string' || !config.codexModel.trim())) ||
       !Number.isInteger(config.maxSessionCandidates) || config.maxSessionCandidates < 1 || config.maxSessionCandidates > 100) {
-    throw new Error('收件箱配置无效；当前版本支持一个 AI 任务并发');
+    throw new Error('收件箱配置无效；AI 并发不得超过会话池容量，池容量支持 1 至 5');
   }
   return config;
 }

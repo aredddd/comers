@@ -65,6 +65,8 @@ export interface CodexThreadTurnSummary {
 
 export interface CodexThreadDetail extends CodexThreadHistoryEntry {
   turns: CodexThreadTurnSummary[];
+  turnsTruncated?: boolean;
+  itemsView?: 'full' | 'summary';
 }
 
 export type CodexHistoryErrorCode =
@@ -228,12 +230,32 @@ export async function listCodexThreadHistory(
 }
 
 export async function readCodexThreadDetail(
-  options: Omit<ListCodexThreadHistoryOptions, 'limit'> & { threadId: string },
+  options: Omit<ListCodexThreadHistoryOptions, 'limit'> & { threadId: string; turnLimit?: number; fullUserText?: boolean },
 ): Promise<CodexThreadDetail> {
-  const result = await codexAppServerRequest(options, 'thread/read', {
-    threadId: options.threadId,
-    includeTurns: true,
-  });
+  let result: unknown;
+  let paginatedTurns: unknown[] | undefined;
+  let turnsTruncated = false;
+  let itemsView: 'full' | 'summary' = 'full';
+  try {
+    result = await codexAppServerRequest(options, 'thread/read', { threadId: options.threadId, includeTurns: true });
+  } catch (error) {
+    if (!(error instanceof Error) || !/paginated threads do not support thread\/read/i.test(error.message)) throw error;
+    result = await codexAppServerRequest(options, 'thread/read', { threadId: options.threadId, includeTurns: false });
+    const turnParams = { threadId: options.threadId, limit: options.turnLimit ?? 50, sortDirection: 'desc' };
+    let turnsResult: unknown;
+    try { turnsResult = await codexAppServerRequest(options, 'thread/turns/list', { ...turnParams, itemsView: 'full' }); }
+    catch (turnError) {
+      // New Desktop tool records may not deserialize in an older CLI. Read the
+      // text summaries without resuming the source, and disclose omitted tools.
+      if (!(turnError instanceof Error) || !/failed to deserialize stored thread item/i.test(turnError.message)) throw turnError;
+      itemsView = 'summary';
+      turnsResult = await codexAppServerRequest(options, 'thread/turns/list', { ...turnParams, itemsView });
+    }
+    const page = recordValue(turnsResult);
+    if (!Array.isArray(page?.data)) throw new CodexHistoryError('malformed-response', 'codex returned malformed thread/turns/list response');
+    paginatedTurns = [...page.data].reverse();
+    turnsTruncated = Boolean(page.nextCursor);
+  }
   const raw = recordValue(result);
   const thread = normalizeThread(raw?.thread);
   const threadRaw = recordValue(raw?.thread);
@@ -242,9 +264,11 @@ export async function readCodexThreadDetail(
   }
   return {
     ...thread,
-    turns: Array.isArray(threadRaw.turns)
-      ? threadRaw.turns
-          .map(normalizeTurn)
+    itemsView,
+    turnsTruncated: turnsTruncated || Boolean(options.turnLimit && Array.isArray(threadRaw.turns) && threadRaw.turns.length > options.turnLimit),
+    turns: paginatedTurns || Array.isArray(threadRaw.turns)
+      ? (paginatedTurns ?? threadRaw.turns as unknown[]).slice(-(options.turnLimit ?? Infinity))
+          .map((turn) => normalizeTurn(turn, options.fullUserText === true))
           .filter((turn): turn is CodexThreadTurnSummary => Boolean(turn))
       : [],
   };
@@ -403,7 +427,7 @@ function normalizeThread(input: unknown): CodexThreadHistoryEntry | undefined {
   };
 }
 
-function normalizeTurn(input: unknown): CodexThreadTurnSummary | undefined {
+function normalizeTurn(input: unknown, fullUserText = false): CodexThreadTurnSummary | undefined {
   const raw = recordValue(input);
   const turnId = stringValue(raw?.id);
   if (!raw || !turnId) return undefined;
@@ -435,7 +459,7 @@ function normalizeTurn(input: unknown): CodexThreadTurnSummary | undefined {
     status: stringValue(raw.status) ?? 'unknown',
     ...(startedAt !== undefined ? { startedAtMs: Math.round(startedAt * 1000) } : {}),
     ...(completedAt !== undefined ? { completedAtMs: Math.round(completedAt * 1000) } : {}),
-    ...(userText.trim() ? { userText: normalizeSessionPreview(userText) } : {}),
+    ...(userText.trim() ? { userText: fullUserText ? userText.trim() : normalizeSessionPreview(userText) } : {}),
     ...(assistantText.trim() ? { assistantText: assistantText.trim() } : {}),
     tools,
   };

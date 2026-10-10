@@ -65,9 +65,12 @@ export interface InboxConfig {
   overlapMs: number;
   messageLookbackMs: number;
   maxConcurrentRuns: number;
+  sessionPoolSize: number;
   agentTimeoutMs: number;
   codexBinary: string;
   codexModel?: string;
+  /** Fixed project directory for the one persistent inbox thread. */
+  sessionProjectDir?: string;
   sources: SourceKind[];
   defectTypeKeys: string[];
   routes: InboxRoute[];
@@ -78,7 +81,8 @@ export const DEFAULT_INBOX_CONFIG: InboxConfig = {
   intervalMs: 10_000,
   overlapMs: 5 * 60_000,
   messageLookbackMs: 30 * 60_000,
-  maxConcurrentRuns: 1,
+  maxConcurrentRuns: 3,
+  sessionPoolSize: 3,
   agentTimeoutMs: 20 * 60_000,
   codexBinary: 'codex',
   sources: ['p2p', 'mention', 'defect'],

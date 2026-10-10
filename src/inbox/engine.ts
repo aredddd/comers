@@ -1,5 +1,6 @@
 import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
+import { SessionPoolBusy } from '../scheduler/session-pool';
 import { ProcessPool } from '../bot/process-pool';
 import { InboxCliError } from './cli-client';
 import { InboxStore } from './store';
@@ -152,7 +153,7 @@ export class InboxEngine {
       await this.store.update((state) => {
         const item = state.items.find((row) => row.id === id)!;
         const changed = item.revision !== claimed!.revision;
-        item.status = changed ? 'queued' : this.stopped ? 'interrupted' : 'failed';
+        item.status = changed || error instanceof SessionPoolBusy ? 'queued' : this.stopped ? 'interrupted' : 'failed';
         item.error = error instanceof Error ? error.message.slice(0, 300) : '执行失败';
         item.revision++;
       });
