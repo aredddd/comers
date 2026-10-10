@@ -32,6 +32,10 @@ export interface CodexAdapterOptions {
   sandbox?: SandboxMode;
   stopGraceMs?: number;
   larkChannel?: LarkChannelEnvContext;
+  /** Non-chat workers can supply their own developer-level operating policy. */
+  systemPrompt?: string;
+  /** Resume failures must not fall back to an independent exec conversation. */
+  requireAppServer?: boolean;
 }
 
 type CodexChild = SpawnedProcessByStdio<Writable, Readable, Readable>;
@@ -50,6 +54,8 @@ export class CodexAdapter implements AgentAdapter {
   private readonly sandbox: SandboxMode;
   private readonly defaultStopGraceMs: number;
   private readonly larkChannel: LarkChannelEnvContext | undefined;
+  private readonly optionsSystemPrompt: string | undefined;
+  private readonly requireAppServer: boolean;
   private botIdentity: AgentBotIdentity | undefined;
   private readonly appServerSessions = new Map<string, CodexAppServerSession>();
   private readonly preparedRuns = new Map<
@@ -68,6 +74,8 @@ export class CodexAdapter implements AgentAdapter {
     this.sandbox = opts.sandbox ?? 'danger-full-access';
     this.defaultStopGraceMs = opts.stopGraceMs ?? 5000;
     this.larkChannel = opts.larkChannel;
+    this.optionsSystemPrompt = opts.systemPrompt;
+    this.requireAppServer = opts.requireAppServer === true;
   }
 
   setBotIdentity(identity: AgentBotIdentity): void {
@@ -141,6 +149,7 @@ export class CodexAdapter implements AgentAdapter {
           inheritCodexHome: this.inheritCodexHome,
           ...(this.larkChannel ? { larkChannel: this.larkChannel } : {}),
           ...(this.botIdentity ? { botIdentity: this.botIdentity } : {}),
+          ...(this.optionsSystemPrompt ? { systemPrompt: this.optionsSystemPrompt } : {}),
         });
         await session.connect();
         this.appServerSessions.set(scopeId, session);
@@ -151,7 +160,7 @@ export class CodexAdapter implements AgentAdapter {
       // Compatibility escape hatch for older/partially-installed Codex builds.
       // A single failed rich-runtime startup must not take the already-working
       // personal bot offline; the run falls back to `codex exec` and logs why.
-      log.warn('app-server', 'fallback-exec', { error: errorMessage(error) });
+      log.warn('app-server', this.requireAppServer ? 'required-runtime-failed' : 'fallback-exec', { error: errorMessage(error) });
       if (session) {
         if (this.appServerSessions.get(scopeId) === session) {
           this.appServerSessions.delete(scopeId);
@@ -162,6 +171,7 @@ export class CodexAdapter implements AgentAdapter {
           });
         });
       }
+      if (this.requireAppServer) throw error;
       this.preparedRuns.set(opts.runId, { kind: 'exec' });
     }
   }
@@ -248,7 +258,9 @@ export class CodexAdapter implements AgentAdapter {
     child.stdin.on('error', (err) => {
       log.warn('agent', 'stdin-error', { message: err.message });
     });
-    child.stdin.end(prefixBridgeSystemPrompt(opts.prompt, this.botIdentity), 'utf8');
+    child.stdin.end(this.optionsSystemPrompt
+      ? `${this.optionsSystemPrompt}\n\n${opts.prompt}`
+      : prefixBridgeSystemPrompt(opts.prompt, this.botIdentity), 'utf8');
 
     const stopGraceMs = opts.stopGraceMs ?? this.defaultStopGraceMs;
 

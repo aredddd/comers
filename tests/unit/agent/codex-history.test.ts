@@ -1,12 +1,14 @@
 import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   CodexHistoryError,
+  readCodexThreadDetail,
   listCodexThreadHistory,
   updateCodexThreadName,
 } from '../../../src/session/codex-history.js';
+import { CodexAppServerClient } from '../../../src/agent/codex/app-server-client';
 import { buildAgentPrompt } from '../../../src/agent/prompt.js';
 
 interface FakeCodex {
@@ -20,6 +22,7 @@ describe('Codex thread history provider', () => {
   const oldCodexHome = process.env.CODEX_HOME;
 
   afterEach(async () => {
+    vi.restoreAllMocks();
     if (oldCodexHome === undefined) {
       delete process.env.CODEX_HOME;
     } else {
@@ -30,6 +33,39 @@ describe('Codex thread history provider', () => {
         rm(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 25 }),
       ),
     );
+  });
+
+  it('读取分页会话的最近完整 turn，不 resume 源会话且标注更早资料未加载', async () => {
+    vi.spyOn(CodexAppServerClient.prototype, 'connect').mockResolvedValue();
+    vi.spyOn(CodexAppServerClient.prototype, 'close').mockResolvedValue();
+    const request = vi.spyOn(CodexAppServerClient.prototype, 'request')
+      .mockRejectedValueOnce(new Error('paginated threads do not support thread/read(includeTurns=true)'))
+      .mockResolvedValueOnce({ thread: { id: 'original', cwd: '/repo' } })
+      .mockResolvedValueOnce({ data: [
+        { id: 'new', status: 'completed', items: [{ type: 'userMessage', content: [{ type: 'text', text: '最新上下文' + '细节'.repeat(100) }] }] },
+        { id: 'old', status: 'completed', items: [{ type: 'agentMessage', text: '上一轮结论' }] },
+      ], nextCursor: 'earlier-turns' });
+    const detail = await readCodexThreadDetail({ binary: 'codex', profileStateDir: '/tmp', threadId: 'original', turnLimit: 8, fullUserText: true });
+    expect(detail.turns.map((turn) => turn.turnId)).toEqual(['old', 'new']); expect(detail.turns[1]!.userText).toBe('最新上下文' + '细节'.repeat(100));
+    expect(detail.turnsTruncated).toBe(true);
+    expect(request.mock.calls.map(([method]) => method)).toEqual(['thread/read', 'thread/read', 'thread/turns/list']);
+    expect(request.mock.calls[2]![1]).toEqual({ threadId: 'original', limit: 8, sortDirection: 'desc', itemsView: 'full' });
+  });
+
+  it('工具记录不兼容时只读文字摘要并显式标注，其他错误不会静默降级', async () => {
+    vi.spyOn(CodexAppServerClient.prototype, 'connect').mockResolvedValue();
+    vi.spyOn(CodexAppServerClient.prototype, 'close').mockResolvedValue();
+    const request = vi.spyOn(CodexAppServerClient.prototype, 'request')
+      .mockRejectedValueOnce(new Error('paginated threads do not support thread/read(includeTurns=true)'))
+      .mockResolvedValueOnce({ thread: { id: 'original', cwd: '/repo' } })
+      .mockRejectedValueOnce(new Error('failed to deserialize stored thread item: unknown variant'))
+      .mockResolvedValueOnce({ data: [{ id: 'turn', status: 'completed', items: [{ type: 'agentMessage', text: '历史文字背景' }] }], nextCursor: null });
+    const detail = await readCodexThreadDetail({ binary: 'codex', profileStateDir: '/tmp', threadId: 'original', turnLimit: 8 });
+    expect(detail.itemsView).toBe('summary'); expect(detail.turns[0]!.assistantText).toBe('历史文字背景');
+    expect(request.mock.calls[3]![1]).toMatchObject({ itemsView: 'summary' });
+    request.mockRejectedValueOnce(new Error('permission denied'));
+    await expect(readCodexThreadDetail({ binary: 'codex', profileStateDir: '/tmp', threadId: 'original' })).rejects.toThrow('permission denied');
+    expect(request).toHaveBeenCalledTimes(5);
   });
 
   it('lists cwd-filtered Codex threads through app-server without exposing sub-agent sources', async () => {

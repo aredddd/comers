@@ -418,3 +418,6 @@ export default createAdapter;
 个人网关的持久会话、语音入口、定时调度和崩溃恢复思路参考了开源的 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent)。Codex 连接、task 管理、审批和运行控制使用的是 [Codex App Server](https://learn.chatgpt.com/docs/app-server) 协议；本项目没有把 Hermes 运行时嵌进来。
 
 <img src="./assets/feedback-group-qr.png" alt="飞书反馈群二维码" width="360">
+# AI 工作收件箱
+
+新增独立的 comers inbox 命令：每 10 秒检查私聊、群聊 @ 和 Meegle 缺陷变化，每轮重新读取关联会话上下文，并复用固定容量的处理会话池，产出代码与回复草稿供分别审阅。详见[使用说明](docs/INBOX.zh.md)。

@@ -96,6 +96,8 @@ export interface AgentRunOptions {
   images?: readonly string[];
   audios?: readonly string[];
   sandbox?: CodexSandboxMode;
+  /** Additional write roots for an app-server workspace-write turn. */
+  writableRoots?: readonly string[];
   permissionMode?: ClaudePermissionMode;
   deliveryContext?: AgentDeliveryContext;
   /**
