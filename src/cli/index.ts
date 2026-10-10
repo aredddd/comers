@@ -25,6 +25,7 @@ import {
 } from './commands/service';
 import { runStart } from './commands/start';
 import { runUi } from './commands/ui';
+import { registerInboxCommands } from './commands/inbox';
 
 const program = new Command();
 
@@ -32,6 +33,8 @@ program
   .name('comers')
   .description('Use Feishu/Lark as a mobile client for local Codex tasks')
   .version(pkg.version, '-v, --version');
+
+registerInboxCommands(program);
 
 // === process-level commands (work directly on bridge processes) ===
 

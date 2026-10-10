@@ -36,7 +36,9 @@
     "README.zh.md",
     "PERSONAL_CODEX_SETUP.zh.md",
     "NOTICE.md",
-    "LICENSE"
+    "LICENSE",
+    "docs",
+    "skills"
   ],
   "scripts": {
     "dev": "tsup --watch",

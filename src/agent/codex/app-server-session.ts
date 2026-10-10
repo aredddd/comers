@@ -36,6 +36,7 @@ export interface CodexAppServerSessionOptions {
   inheritCodexHome: boolean;
   larkChannel?: LarkChannelEnvContext;
   botIdentity?: AgentBotIdentity;
+  systemPrompt?: string;
 }
 
 export class CodexAppServerSession {
@@ -90,7 +91,7 @@ export class CodexAppServerSession {
       ...(this.model ? { model: this.model } : {}),
       approvalPolicy: 'on-request',
       sandbox: this.sandbox,
-      developerInstructions: buildBridgeSystemPrompt(this.options.botIdentity),
+      developerInstructions: this.options.systemPrompt ?? buildBridgeSystemPrompt(this.options.botIdentity),
     };
     const response = this.requestedThreadId
       ? await this.client.request('thread/resume', {

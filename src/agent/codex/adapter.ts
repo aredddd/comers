@@ -32,6 +32,8 @@ export interface CodexAdapterOptions {
   sandbox?: SandboxMode;
   stopGraceMs?: number;
   larkChannel?: LarkChannelEnvContext;
+  /** Non-chat workers can supply their own developer-level operating policy. */
+  systemPrompt?: string;
 }
 
 type CodexChild = SpawnedProcessByStdio<Writable, Readable, Readable>;
@@ -50,6 +52,7 @@ export class CodexAdapter implements AgentAdapter {
   private readonly sandbox: SandboxMode;
   private readonly defaultStopGraceMs: number;
   private readonly larkChannel: LarkChannelEnvContext | undefined;
+  private readonly optionsSystemPrompt: string | undefined;
   private botIdentity: AgentBotIdentity | undefined;
   private readonly appServerSessions = new Map<string, CodexAppServerSession>();
   private readonly preparedRuns = new Map<
@@ -68,6 +71,7 @@ export class CodexAdapter implements AgentAdapter {
     this.sandbox = opts.sandbox ?? 'danger-full-access';
     this.defaultStopGraceMs = opts.stopGraceMs ?? 5000;
     this.larkChannel = opts.larkChannel;
+    this.optionsSystemPrompt = opts.systemPrompt;
   }
 
   setBotIdentity(identity: AgentBotIdentity): void {
@@ -141,6 +145,7 @@ export class CodexAdapter implements AgentAdapter {
           inheritCodexHome: this.inheritCodexHome,
           ...(this.larkChannel ? { larkChannel: this.larkChannel } : {}),
           ...(this.botIdentity ? { botIdentity: this.botIdentity } : {}),
+          ...(this.optionsSystemPrompt ? { systemPrompt: this.optionsSystemPrompt } : {}),
         });
         await session.connect();
         this.appServerSessions.set(scopeId, session);
@@ -248,7 +253,9 @@ export class CodexAdapter implements AgentAdapter {
     child.stdin.on('error', (err) => {
       log.warn('agent', 'stdin-error', { message: err.message });
     });
-    child.stdin.end(prefixBridgeSystemPrompt(opts.prompt, this.botIdentity), 'utf8');
+    child.stdin.end(this.optionsSystemPrompt
+      ? `${this.optionsSystemPrompt}\n\n${opts.prompt}`
+      : prefixBridgeSystemPrompt(opts.prompt, this.botIdentity), 'utf8');
 
     const stopGraceMs = opts.stopGraceMs ?? this.defaultStopGraceMs;
 
