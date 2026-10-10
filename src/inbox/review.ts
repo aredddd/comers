@@ -9,6 +9,15 @@ import { codeSnapshot, git } from './workspace';
 
 const exec = promisify(execFile);
 export interface ReviewInput { itemId: string; artifactId?: string; revision: number; body?: string }
+export function mergeRequestRepository(remote: string): { host: string; isGithub: boolean; repository: string } {
+  let url: URL;
+  try { url = new URL(remote.startsWith('git@') ? `ssh://${remote.replace(':', '/')}` : remote); }
+  catch { throw new Error('无法确认仓库远端'); }
+  const path = url.pathname.replace(/^\//, '').replace(/\.git$/, '');
+  if (!['https:', 'ssh:'].includes(url.protocol) || !url.hostname || !path.includes('/') || /[?#]/.test(path)) throw new Error('无法确认仓库远端');
+  const isGithub = url.hostname === 'github.com';
+  return { host: url.hostname, isGithub, repository: isGithub ? path : `https://${url.host}/${path}` };
+}
 export class InboxReview {
   constructor(private readonly store: InboxStore, private readonly stateDir: string,
     private readonly cli: JsonCli = runJsonCli) {}
@@ -57,9 +66,7 @@ export class InboxReview {
     const snapshot = await codeSnapshot(item.worktree);
     if (snapshot.fingerprint !== artifact.codeFingerprint) throw new Error('代码已变化，请重新生成并审阅');
     const remote = await git(item.worktree, ['remote', 'get-url', 'origin']);
-    const host = remote.match(/^(?:https:\/\/|git@)([^/:]+)[/:]/)?.[1];
-    if (!host) throw new Error('无法确认仓库远端');
-    const isGithub = host === 'github.com';
+    const { host, isGithub, repository } = mergeRequestRepository(remote);
     const binary = isGithub ? 'gh' : 'glab';
     // Verify auth and branch target before staging/pushing anything.
     try { await exec(binary, ['auth', 'status', ...(isGithub ? [] : ['--hostname', host])], { cwd: item.worktree, timeout: 20_000 }); }
@@ -83,7 +90,7 @@ export class InboxReview {
           : ['mr', 'update', existing, '--title', artifact.title, '--description', artifact.body]
         : isGithub ? ['pr', 'create', '--draft', '--base', base, '--head', branch, '--title', artifact.title, '--body-file', bodyPath]
           : ['mr', 'create', '--draft', '--target-branch', base, '--source-branch', branch, '--title', artifact.title, '--description', artifact.body, '--yes'];
-      const response = await exec(binary, args, { cwd: item.worktree, timeout: 60_000, maxBuffer: 128_000 });
+      const response = await exec(binary, [...args, '--repo', repository], { cwd: item.worktree, timeout: 60_000, maxBuffer: 128_000 });
       const url = existing ?? response.stdout.match(/https:\/\/[^\s]+\/(?:pull|merge_requests|(?:-\/merge_requests))\/\d+/)?.[0];
       if (!url) throw new Error('远端没有返回 MR 链接');
       await this.finish(input, 'sent', url);

@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { InboxStore } from '../../../src/inbox/store';
 import { InboxSources, searchTime } from '../../../src/inbox/sources';
-import { InboxReview } from '../../../src/inbox/review';
+import { InboxReview, mergeRequestRepository } from '../../../src/inbox/review';
 import { InboxEngine } from '../../../src/inbox/engine';
 import { InboxCliError, type JsonCli } from '../../../src/inbox/cli-client';
 import { DEFAULT_INBOX_CONFIG, type InboxEvent, type InboxItem, type InboxConfig } from '../../../src/inbox/types';
@@ -28,6 +28,12 @@ async function reviewable(store: InboxStore) {
   return store.snapshot().items[0]!;
 }
 describe('inbox durability and review gates', () => {
+  it('草稿 MR 显式绑定 origin，fork 仓库不受 CLI 的 upstream 默认值影响', () => {
+    expect(mergeRequestRepository('https://github.com/owner/fork.git')).toEqual({ host: 'github.com', isGithub: true, repository: 'owner/fork' });
+    expect(mergeRequestRepository('git@git.example.com:group/subgroup/repo.git')).toEqual({ host: 'git.example.com', isGithub: false, repository: 'https://git.example.com/group/subgroup/repo' });
+    expect(mergeRequestRepository('ssh://git@git.example.com/group/repo.git').repository).toBe('https://git.example.com/group/repo');
+    expect(() => mergeRequestRepository('/local/repo')).toThrow('无法确认');
+  });
   it('去重与游标在同一个可恢复快照中保存', async () => {
     const { store } = await fixture(); await ingest(store); await ingest(store);
     expect(store.snapshot().items).toHaveLength(1);
